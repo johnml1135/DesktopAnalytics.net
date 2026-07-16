@@ -1,4 +1,6 @@
-﻿using Segment.Serialization;
+﻿using System.Threading;
+using System.Threading.Tasks;
+using Segment.Serialization;
 
 namespace DesktopAnalytics
 {
@@ -9,6 +11,39 @@ namespace DesktopAnalytics
 		void Identify(string analyticsId, JsonObject traits, JsonObject options);
 		void Track(string defaultIdForAnalytics, string eventName, JsonObject properties);
 		void Flush();
+
+		/// <summary>
+		/// Async counterpart of <see cref="ShutDown"/>. Implementations whose shutdown has nothing
+		/// awaitable (see <see cref="SegmentClient"/>) may complete synchronously; implementations
+		/// with real async delivery work (see <see cref="MixpanelClient"/>) must never block a
+		/// thread waiting on it. Like every member here, must not throw -- including on
+		/// cancellation, which just ends any in-flight delivery early (events stay queued).
+		/// </summary>
+		Task ShutDownAsync(CancellationToken cancellationToken = default);
+
+		/// <summary>
+		/// Async counterpart of <see cref="Flush"/>. Same contract notes as
+		/// <see cref="ShutDownAsync"/>.
+		/// </summary>
+		Task FlushAsync(CancellationToken cancellationToken = default);
+
 		Statistics Statistics { get; }
+
+		/// <summary>
+		/// Called when the user revokes tracking consent (<see cref="Analytics.AllowTracking"/>
+		/// transitioning to false). Implementations that spool events on disk (see
+		/// <see cref="MixpanelClient"/>) must purge that spool immediately; implementations without a
+		/// local spool (see <see cref="SegmentClient"/>) can no-op.
+		/// </summary>
+		void PurgeQueuedEvents();
+
+		/// <summary>
+		/// Called when the user grants tracking consent again (<see cref="Analytics.AllowTracking"/>
+		/// transitioning back to true) on an already-initialized client, after a prior
+		/// <see cref="PurgeQueuedEvents"/> paused it. Implementations with a background flush loop (see
+		/// <see cref="MixpanelClient"/>) must re-arm it; implementations without one (see
+		/// <see cref="SegmentClient"/>) can no-op.
+		/// </summary>
+		void ResumeSending();
 	}
 }

@@ -11,6 +11,7 @@ using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Xml.Linq;
 using System.Xml.XPath;
 using JetBrains.Annotations;
@@ -739,6 +740,22 @@ namespace DesktopAnalytics
 		}
 
 		/// <summary>
+		/// Async alternative to <see cref="Dispose"/> for hosts that shut down asynchronously:
+		/// flushes/shuts down the underlying client without blocking a thread on any in-flight
+		/// delivery. Bounded just like Dispose -- an offline shutdown still returns promptly, with
+		/// undelivered events left on disk (Mixpanel) or in the transport library's own store
+		/// (Segment) for the next launch. Calling <see cref="Dispose"/> afterwards (e.g. from a
+		/// <c>using</c> block wrapping this object) is a harmless no-op.
+		/// </summary>
+		/// <param name="cancellationToken">Optionally ends the final delivery attempt even sooner
+		/// than its own bound; undelivered events stay queued for the next launch. Cancellation
+		/// never faults the task.</param>
+		public Task ShutDownAsync(CancellationToken cancellationToken = default)
+		{
+			return _client?.ShutDownAsync(cancellationToken) ?? Task.CompletedTask;
+		}
+
+		/// <summary>
 		/// Indicates whether we are tracking or not
 		/// </summary>
 		public static bool AllowTracking
@@ -764,6 +781,34 @@ namespace DesktopAnalytics
 						s_singleton._deferredInitializationParameters = null;
 						s_singleton.Initialize(initializationParameters);
 						return; // Initialize sets s_allowTracking = true
+					}
+
+					// Already initialized and now re-enabled: re-arm any background flush loop that a
+					// prior PurgeQueuedEvents (consent revocation) paused. See offline-analytics.md.
+					try
+					{
+						s_singleton._client?.ResumeSending();
+					}
+					catch (Exception e)
+					{
+						Debug.WriteLine("Analytics.AllowTracking: ResumeSending failed: " + e);
+					}
+				}
+
+				if (!value)
+				{
+					// Consent revoked: purge any durable client's on-disk spool immediately (see
+					// offline-analytics.md, "Consent & lifecycle"). Guarded against a null singleton
+					// (AllowTracking can technically be set before an Analytics object is
+					// constructed) and a null client (the Segment/Mixpanel client is only assigned
+					// inside the Analytics constructor).
+					try
+					{
+						s_singleton?._client?.PurgeQueuedEvents();
+					}
+					catch (Exception e)
+					{
+						Debug.WriteLine("Analytics.AllowTracking: PurgeQueuedEvents failed: " + e);
 					}
 				}
 
@@ -1082,7 +1127,19 @@ namespace DesktopAnalytics
 
 		public static void FlushClient()
 		{
-			s_singleton._client?.Flush();
+			s_singleton?._client?.Flush();
+		}
+
+		/// <summary>
+		/// Async counterpart of <see cref="FlushClient"/>: attempts delivery of anything pending
+		/// without blocking a thread on the network. Bounded -- returns promptly even while
+		/// offline, leaving undelivered events queued.
+		/// </summary>
+		/// <param name="cancellationToken">Optionally ends the flush even sooner than its own
+		/// bound; undelivered events stay queued. Cancellation never faults the task.</param>
+		public static Task FlushClientAsync(CancellationToken cancellationToken = default)
+		{
+			return s_singleton?._client?.FlushAsync(cancellationToken) ?? Task.CompletedTask;
 		}
 	}
 }

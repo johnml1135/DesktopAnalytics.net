@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 using Segment.Concurrent;
 using Segment.Serialization;
 
@@ -67,8 +69,43 @@ namespace DesktopAnalytics
 			_analytics.Flush();
 		}
 
+		/// <summary>
+		/// Completes synchronously: Segment.Analytics.CSharp's <c>Flush()</c> only signals the
+		/// library's own background delivery (its coroutine system) and exposes nothing awaitable,
+		/// so there is no async work to represent here.
+		/// </summary>
+		public Task ShutDownAsync(CancellationToken cancellationToken = default)
+		{
+			ShutDown();
+			return Task.CompletedTask;
+		}
+
+		/// <summary>See <see cref="ShutDownAsync"/> for why this completes synchronously.</summary>
+		public Task FlushAsync(CancellationToken cancellationToken = default)
+		{
+			Flush();
+			return Task.CompletedTask;
+		}
+
 		public Statistics Statistics => new Statistics(StatMonitor.Submitted,
 			StatMonitor.Succeeded, StatMonitor.Failed);
+
+		/// <summary>
+		/// The Segment path already gets offline durability from Segment.Analytics.CSharp's own
+		/// on-disk storage/retry, and this class does not maintain a separate spool of its own -- so
+		/// there is nothing here to purge on consent revocation.
+		/// </summary>
+		public void PurgeQueuedEvents()
+		{
+		}
+
+		/// <summary>
+		/// No-op: this client has no separate background flush loop of its own to re-arm (the
+		/// Segment.Analytics.CSharp library manages its own delivery), so there is nothing to resume.
+		/// </summary>
+		public void ResumeSending()
+		{
+		}
 
 		public void OnExceptionThrown(Exception e)
 		{
