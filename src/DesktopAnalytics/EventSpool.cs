@@ -532,6 +532,93 @@ namespace DesktopAnalytics
 		}
 
 		/// <summary>
+		/// Enforces an age-based retention floor: removes events from the FRONT of the queue
+		/// (oldest first -- the queue is already FIFO) whose stamped <see cref="AnalyticsEvent.Time"/>
+		/// is older than <paramref name="now"/> minus <paramref name="maxAge"/>, stopping as soon as
+		/// it reaches an event that is NOT expired -- everything after it, being newer, cannot be
+		/// expired either. This is an ADDITIONAL, independent eviction dimension alongside the
+		/// item/byte caps enforced by <see cref="EnforceCapLocked"/>, not a replacement for them:
+		/// callers (see <see cref="MixpanelClient"/>'s cap constants) should size those caps to
+		/// comfortably outlast <paramref name="maxAge"/> under realistic usage, so this age floor --
+		/// not the item/byte caps -- is normally what reclaims space from a long-offline backlog.
+		/// </summary>
+		/// <remarks>
+		/// An entry that fails to deserialize (corrupt, or an incompatible schema version) can never
+		/// be dated, so it is dropped exactly like <see cref="ProcessBatchAsync"/> does with such an
+		/// entry, regardless of age. Never throws: any disk/IO/serialization failure is logged and
+		/// swallowed, leaving the spool exactly as it was found.
+		/// </remarks>
+		/// <param name="maxAge">The maximum age a queued event may reach before being dropped.</param>
+		/// <param name="now">The current time, from the caller's injected <see cref="TimeProvider"/>
+		/// so tests stay deterministic -- never <c>DateTimeOffset.UtcNow</c> directly.</param>
+		public void TrimExpired(TimeSpan maxAge, DateTimeOffset now)
+		{
+			try
+			{
+				var cutoff = now - maxAge;
+
+				_sync.Wait();
+				try
+				{
+					while (true)
+					{
+						byte[] bytes;
+						using (var session = _queue.OpenSession())
+						{
+							try
+							{
+								bytes = session.Dequeue();
+							}
+							catch (Exception e)
+							{
+								Debug.WriteLine("EventSpool.TrimExpired: dequeue failed, giving up: " + e);
+								return;
+							}
+
+							if (bytes == null)
+								return; // Spool is empty.
+
+							AnalyticsEvent evt = null;
+							var deserializeFailed = false;
+							try
+							{
+								evt = AnalyticsEvent.FromBytes(bytes);
+							}
+							catch (Exception e)
+							{
+								deserializeFailed = true;
+								Debug.WriteLine(
+									"EventSpool.TrimExpired: failed to deserialize event, dropping: " + e);
+							}
+
+							if (!deserializeFailed && evt.Time >= cutoff)
+							{
+								// Not expired -- and, by FIFO order, nothing after it can be expired
+								// either. Do not flush: disposing the session without committing rolls
+								// this dequeue back, leaving it (and everything behind it) in the queue.
+								return;
+							}
+
+							// Either genuinely expired, or undatable (corrupt/incompatible) and thus
+							// can never be aged out any other way -- commit its removal either way.
+							session.Flush();
+							_spoolBytes = Math.Max(0, _spoolBytes - bytes.Length);
+							PersistSpoolBytesLocked(_spoolBytes);
+						}
+					}
+				}
+				finally
+				{
+					_sync.Release();
+				}
+			}
+			catch (Exception e)
+			{
+				Debug.WriteLine("EventSpool.TrimExpired failed: " + e);
+			}
+		}
+
+		/// <summary>
 		/// Empties the spool entirely (used on consent revocation), removing the event data from
 		/// disk -- not merely marking it consumed. Never throws.
 		/// </summary>
@@ -547,41 +634,95 @@ namespace DesktopAnalytics
 		/// briefly released; if another process steals it in that window the reopen fails, this
 		/// spool degrades to a no-op (every method here already tolerates that), and the purge
 		/// itself has still succeeded -- the data is gone, which is the property that matters.
+		/// <para>
+		/// The wait to acquire <see cref="_sync"/> here is bounded (<see cref="s_lockWaitTimeout"/>)
+		/// rather than unbounded, because <see cref="PurgeQueuedEvents"/>-style callers (e.g.
+		/// <c>Analytics.AllowTracking</c>'s setter, plausibly invoked from a UI thread handling a
+		/// consent checkbox) call this synchronously, and an in-flight send that is slow to observe
+		/// cancellation must not be able to block that caller's thread indefinitely. If the bounded
+		/// wait times out, this method does NOT give up on purging -- that would violate the
+		/// consent/privacy guarantee that the data is deleted -- it instead logs and finishes the
+		/// purge on a background <see cref="Task.Run(Action)"/> that waits for <see cref="_sync"/>
+		/// without a bound (acceptable there since it is off the caller's thread) and then runs the
+		/// same dispose+delete+reopen logic.
+		/// </para>
 		/// </remarks>
 		public void Purge()
 		{
 			try
 			{
-				_sync.Wait();
-				try
+				if (_sync.Wait(s_lockWaitTimeout))
 				{
-					if (_disposed)
-						return;
-
 					try
 					{
-						_queue?.Dispose();
+						if (_disposed)
+							return;
+
+						PurgeLocked();
 					}
 					finally
 					{
-						_queue = null;
+						_sync.Release();
 					}
-
-					if (Directory.Exists(_spoolDirectory))
-						Directory.Delete(_spoolDirectory, true);
-
-					_queue = PersistentQueue.WaitFor(_spoolDirectory, s_lockWaitTimeout);
-					_spoolBytes = 0;
 				}
-				finally
+				else
 				{
-					_sync.Release();
+					// Could not acquire the lock within the bound (most likely an in-flight send
+					// still holding it, slow to observe cancellation). Do not give up on the purge --
+					// it's a consent/privacy guarantee -- finish it on a background thread instead,
+					// where an unbounded wait is acceptable because it no longer blocks the caller.
+					Debug.WriteLine(
+						"EventSpool.Purge: timed out waiting for the lock; completing the purge in the " +
+						"background instead of blocking the caller.");
+					Task.Run(() =>
+					{
+						try
+						{
+							_sync.Wait();
+							try
+							{
+								if (_disposed)
+									return;
+
+								PurgeLocked();
+							}
+							finally
+							{
+								_sync.Release();
+							}
+						}
+						catch (Exception e)
+						{
+							Debug.WriteLine("EventSpool.Purge (background fallback) failed: " + e);
+						}
+					});
 				}
 			}
 			catch (Exception e)
 			{
 				Debug.WriteLine("EventSpool.Purge failed: " + e);
 			}
+		}
+
+		// Caller must already hold _sync. Shared by both the fast (in-bound) path and the
+		// background fallback path of Purge() so the actual purge body -- dispose the queue,
+		// delete the directory, reopen, reset _spoolBytes -- is implemented exactly once.
+		private void PurgeLocked()
+		{
+			try
+			{
+				_queue?.Dispose();
+			}
+			finally
+			{
+				_queue = null;
+			}
+
+			if (Directory.Exists(_spoolDirectory))
+				Directory.Delete(_spoolDirectory, true);
+
+			_queue = PersistentQueue.WaitFor(_spoolDirectory, s_lockWaitTimeout);
+			_spoolBytes = 0;
 		}
 
 		/// <summary>

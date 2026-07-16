@@ -54,6 +54,11 @@ namespace DesktopAnalyticsTests
 			return AnalyticsEvent.Create("user-1", name);
 		}
 
+		private static AnalyticsEvent MakeEventAt(string name, DateTimeOffset time)
+		{
+			return AnalyticsEvent.Create("user-1", name, time: time);
+		}
+
 		// Drains the spool with an always-Delivered batch callback, returning the event names in
 		// the order they were handed to the sender.
 		private static async Task<List<string>> DrainAllDelivered(EventSpool spool, int maxItems = 100)
@@ -224,6 +229,181 @@ namespace DesktopAnalyticsTests
 				var remaining = await DrainAllDelivered(spool);
 
 				CollectionAssert.AreEqual(new[] { "Event-2", "Event-3", "Event-4" }, remaining);
+			}
+		}
+
+		// 6a. Degenerate cap: maxItems == 0 means even the event just enqueued is evicted (see the
+		// comment on EnforceCapLocked describing this degenerate case). Enqueue itself still
+		// reports success (the write genuinely happened; cap enforcement is a separate step), but
+		// the spool ends up empty.
+		[Test]
+		public void Enqueue_MaxItemsZero_ImmediatelyEvictsTheJustEnqueuedEvent()
+		{
+			using (var spool = new EventSpool(_spoolDir, 0))
+			{
+				Assert.IsTrue(spool.Enqueue(MakeEvent("A")),
+					"Enqueue reports the write itself succeeded, independent of cap enforcement");
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"maxItems == 0 must evict even the event that was just enqueued");
+			}
+		}
+
+		// 6b. Boundary: exactly maxItems enqueued => nothing dropped; one more => the oldest is
+		// dropped and the count stays pinned at the cap.
+		[Test]
+		public async Task Enqueue_ExactlyAtMaxItems_NoneDropped_ThenOneOver_DropsOldestStaysAtCap()
+		{
+			const int maxItems = 5;
+			using (var spool = new EventSpool(_spoolDir, maxItems))
+			{
+				for (var i = 0; i < maxItems; i++)
+					spool.Enqueue(MakeEvent("Event-" + i));
+
+				Assert.AreEqual(maxItems, spool.ApproximateCount,
+					"exactly maxItems events must all be retained");
+
+				spool.Enqueue(MakeEvent("OneMore"));
+
+				Assert.AreEqual(maxItems, spool.ApproximateCount, "count must stay pinned at the cap");
+
+				var remaining = await DrainAllDelivered(spool, maxItems + 5);
+				CollectionAssert.AreEqual(
+					new[] { "Event-1", "Event-2", "Event-3", "Event-4", "OneMore" }, remaining,
+					"the oldest event must be dropped to make room for the one over the cap");
+			}
+		}
+
+		// ---- AGE-BASED RETENTION (TrimExpired) --------------------------------------------------
+
+		// An event older than the max age must be dropped.
+		[Test]
+		public void TrimExpired_EventOlderThanMaxAge_IsDropped()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				var now = DateTimeOffset.UtcNow;
+				spool.Enqueue(MakeEventAt("Old", now - TimeSpan.FromDays(61)));
+
+				spool.TrimExpired(TimeSpan.FromDays(60), now);
+
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"an event older than the max age must be dropped");
+			}
+		}
+
+		// An event within the max age must be retained.
+		[Test]
+		public void TrimExpired_EventWithinMaxAge_IsRetained()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				var now = DateTimeOffset.UtcNow;
+				spool.Enqueue(MakeEventAt("Recent", now - TimeSpan.FromDays(1)));
+
+				spool.TrimExpired(TimeSpan.FromDays(60), now);
+
+				Assert.AreEqual(1, spool.ApproximateCount,
+					"an event within the max age must be retained");
+			}
+		}
+
+		// A mix of expired and fresh events: only the expired PREFIX is dropped (FIFO order), and
+		// the rest survive in their original order.
+		[Test]
+		public async Task TrimExpired_MixOfExpiredAndFreshEvents_DropsOnlyExpiredPrefixKeepsRestInOrder()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				var now = DateTimeOffset.UtcNow;
+				spool.Enqueue(MakeEventAt("Expired-1", now - TimeSpan.FromDays(90)));
+				spool.Enqueue(MakeEventAt("Expired-2", now - TimeSpan.FromDays(70)));
+				spool.Enqueue(MakeEventAt("Fresh-1", now - TimeSpan.FromDays(10)));
+				spool.Enqueue(MakeEventAt("Fresh-2", now - TimeSpan.FromDays(1)));
+
+				spool.TrimExpired(TimeSpan.FromDays(60), now);
+
+				Assert.AreEqual(2, spool.ApproximateCount);
+				var remaining = await DrainAllDelivered(spool);
+				CollectionAssert.AreEqual(new[] { "Fresh-1", "Fresh-2" }, remaining,
+					"only the expired prefix must be dropped; the rest must survive in order");
+			}
+		}
+
+		// TrimExpired on an empty spool is a no-op that must not throw.
+		[Test]
+		public void TrimExpired_EmptySpool_IsNoOpAndDoesNotThrow()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				Assert.DoesNotThrow(() => spool.TrimExpired(TimeSpan.FromDays(60), DateTimeOffset.UtcNow));
+				Assert.AreEqual(0, spool.ApproximateCount);
+			}
+		}
+
+		// ---- DISK I/O FAILURE (degrade gracefully, never throw) ---------------------------------
+
+		// A "disk full"/inaccessible-file analog: make the spool's own data file read-only out from
+		// under it (a real, DiskQueue-external way to force a write failure without hand-rolling a
+		// mock of DiskQueue itself) and confirm Enqueue reports the failure via its return value --
+		// never by throwing -- and does not corrupt the spool's state.
+		[Test]
+		public void Enqueue_DataFileMadeReadOnly_ReturnsFalseAndNeverThrowsAndLeavesSpoolConsistent()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				Assert.IsTrue(spool.Enqueue(MakeEvent("Seed")), "seed event to ensure the data file exists");
+				Assert.AreEqual(1, spool.ApproximateCount);
+
+				var dataFile = Path.Combine(_spoolDir, "data.0");
+				Assert.IsTrue(File.Exists(dataFile), "expected DiskQueue's data file at " + dataFile);
+				File.SetAttributes(dataFile, FileAttributes.ReadOnly);
+				try
+				{
+					bool result = true;
+					Assert.DoesNotThrow(() => result = spool.Enqueue(MakeEvent("ShouldFail")),
+						"a write failure (disk full/inaccessible analog) must never throw out of Enqueue");
+					Assert.IsFalse(result,
+						"a write failure must be reported via Enqueue's return value");
+					Assert.AreEqual(1, spool.ApproximateCount,
+						"a failed write must not corrupt the count of what is actually spooled");
+				}
+				finally
+				{
+					File.SetAttributes(dataFile, FileAttributes.Normal);
+				}
+			}
+		}
+
+		// Same idea for the read/drain side: lock the data file exclusively (simulating it being
+		// momentarily inaccessible) while ProcessBatchAsync is draining. The dequeue must fail
+		// internally, the method must not throw, and -- once the lock is released -- the event must
+		// still be present and retrievable (nothing was lost by the transient failure).
+		[Test]
+		public async Task ProcessBatch_DataFileTransientlyLocked_DegradesGracefullyAndEventSurvives()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				spool.Enqueue(MakeEvent("A"));
+
+				var dataFile = Path.Combine(_spoolDir, "data.0");
+				Assert.IsTrue(File.Exists(dataFile), "expected DiskQueue's data file at " + dataFile);
+
+				var sentDuringLock = new List<string>();
+				using (new FileStream(dataFile, FileMode.Open, FileAccess.Read, FileShare.None))
+				{
+					Assert.DoesNotThrowAsync(async () => await spool.ProcessBatchAsync(10, (batch, ct) =>
+					{
+						sentDuringLock.AddRange(batch.Select(e => e.EventName));
+						return Task.FromResult(SendResult.Delivered);
+					}));
+				}
+
+				Assert.AreEqual(0, sentDuringLock.Count,
+					"the transiently locked file must prevent the dequeue from succeeding");
+
+				var delivered = await DrainAllDelivered(spool);
+				CollectionAssert.AreEqual(new[] { "A" }, delivered,
+					"the event must survive a transient read failure and still be retrievable afterward");
 			}
 		}
 

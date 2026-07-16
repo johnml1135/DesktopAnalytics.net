@@ -29,11 +29,19 @@ namespace DesktopAnalytics
 	{
 		// Open questions in offline-analytics.md: exact cap/batch/cadence values are not locked yet.
 		// These are reasonable starting defaults, not requirements baked in elsewhere.
-		private const int kDefaultMaxSpoolItems = 5000;
+		//
+		// Sized to comfortably OUTLAST the 60-day age floor (kDefaultMaxSpoolAgeDays below) under
+		// realistic desktop-app usage-analytics volumes, rather than being the tightest bound in
+		// practice: EventSpool.TrimExpired's age-based eviction is meant to be what normally
+		// reclaims space from a long-offline backlog, not this item cap. At a generous ~200
+		// events/day of active use, 60 days is on the order of 12,000 events; 20,000 leaves
+		// headroom for bursty days (e.g. an exception storm) without the item cap kicking in well
+		// before the age floor ever would.
+		private const int kDefaultMaxSpoolItems = 20000;
 		// Events per /import request (one request per drain tick). Mixpanel accepts up to 2,000
 		// events and 10MB per request; this stays well under both (the per-tick byte budget below
 		// bounds the request size long before the count does), while draining a large offline
-		// backlog reasonably fast (5000 events in ~13 min at the default cadence).
+		// backlog reasonably fast (20,000 events in ~50 min at the default cadence).
 		private const int kDefaultBatchSize = 200;
 		private const int kDefaultFlushIntervalSeconds = 30;
 
@@ -48,8 +56,20 @@ namespace DesktopAnalytics
 		// Bandwidth courtesy on slow/metered connections: a soft byte budget per flush tick, and a
 		// total-backlog cap (drop-oldest) bounding disk footprint and upload liability. See the
 		// "Constrained bandwidth" section of the PR #43 description for the pacing rationale.
+		// Like kDefaultMaxSpoolItems above, sized to comfortably outlast the 60-day age floor
+		// (kDefaultMaxSpoolAgeDays below): at a generous ~2KB/event average (small usage events
+		// plus occasional larger exception/stack-trace payloads), kDefaultMaxSpoolItems worth of
+		// events is on the order of 40MB; 50MB leaves headroom above that estimate.
 		private const long kMaxBytesPerDrainTick = 256 * 1024;
-		private const long kDefaultMaxSpoolBytes = 20L * 1024 * 1024;
+		private const long kDefaultMaxSpoolBytes = 50L * 1024 * 1024;
+
+		// Age-based retention floor: an ADDITIONAL, independent eviction dimension alongside the
+		// item/byte caps above (enforced separately by EventSpool.TrimExpired), not a replacement
+		// for them. Keeps queued (undelivered) events around for roughly two months of offline time
+		// before dropping them -- a generous, explicit retention floor of our own, rather than
+		// whatever much shorter window Mixpanel's legacy /track endpoint implied (moot here anyway,
+		// since MixpanelEventSender uses /import, which has no such limit).
+		private const int kDefaultMaxSpoolAgeDays = 60;
 
 		// On (re)start, attempt the first drain soon rather than waiting a full interval, so events
 		// spooled during a PREVIOUS (offline) session go out shortly after launch instead of ~30s later.
@@ -83,10 +103,15 @@ namespace DesktopAnalytics
 
 		// Cancels whatever timer-driven send (DrainOnceAsync) is currently in flight when consent is
 		// revoked (see PurgeQueuedEvents), so Purge() does not sit blocked behind a network round trip
-		// and the batch that send was carrying rolls back into the spool instead of being delivered
-		// after revocation. Swapped for a fresh instance on every purge; never used across a purge
-		// boundary. Guarded by Interlocked.Exchange since PurgeQueuedEvents can run on a different
-		// thread (e.g. a UI thread via Analytics.AllowTracking) than the timer-driven drain it cancels.
+		// and the batch that send was carrying rolls back into the spool (which the impending Purge()
+		// then removes) rather than being resent locally after revocation. This is a best-effort
+		// reduction of the window, not a hard guarantee against server-side receipt: if the POST body
+		// was already fully sent to and received by Mixpanel's server before this cancellation is
+		// observed locally, the batch WAS still delivered once -- cancellation only prevents it from
+		// being resent/kept around locally, it cannot recall bytes the server already has. Swapped for
+		// a fresh instance on every purge; never used across a purge boundary. Guarded by
+		// Interlocked.Exchange since PurgeQueuedEvents can run on a different thread (e.g. a UI thread
+		// via Analytics.AllowTracking) than the timer-driven drain it cancels.
 		private CancellationTokenSource _sendCts = new CancellationTokenSource();
 
 		private int _submitted;
@@ -99,6 +124,11 @@ namespace DesktopAnalytics
 		// because all spool access is serialized inside EventSpool (its semaphore); this flag just
 		// keeps a slow drain from stacking up redundant timer callbacks behind it.
 		private int _timerDraining;
+
+		// 0 = not yet shut down; guarded by Interlocked.Exchange in ShutDownAsync so the real
+		// shutdown body (stop timer, bounded drain, dispose spool/sender) runs exactly once, even
+		// if ShutDownAsync/ShutDown is called more than once concurrently.
+		private int _shutDownState;
 
 		/// <summary>
 		/// Production initializer (via <see cref="IClient"/>). Builds a real on-disk spool keyed by
@@ -195,12 +225,18 @@ namespace DesktopAnalytics
 		/// tests that specifically want to exercise real Polly retry/circuit-breaker behavior --
 		/// rather than the zero-strategy default used by <see cref="InitializeForTest"/> -- can build
 		/// one with a deterministic <see cref="TimeProvider"/> (e.g. a zero-delay variant; see
-		/// MixpanelClientTests for the rationale).
+		/// MixpanelClientTests for the rationale). <paramref name="breakDuration"/> similarly lets
+		/// tests shrink the production 5s break duration so a breaker-recovery (half-open -> closed)
+		/// test can wait it out for real, quickly, on the real <see cref="TimeProvider.System"/>
+		/// clock -- rather than driving a <c>FakeTimeProvider</c> through it, which is documented
+		/// (Polly #1932, see offline-analytics.md) to need extra ceremony to make retries fire at
+		/// all.
 		/// </summary>
 		internal static ResiliencePipeline<BatchSendResult> BuildDefaultPipeline(
 			TimeProvider timeProvider,
 			int maxRetryAttempts = 2,
-			TimeSpan? retryDelay = null)
+			TimeSpan? retryDelay = null,
+			TimeSpan? breakDuration = null)
 		{
 			bool ShouldHandleOutcome(Outcome<BatchSendResult> outcome) =>
 				outcome.Exception != null || outcome.Result?.Outcome == SendResult.RetryableFailure;
@@ -227,7 +263,7 @@ namespace DesktopAnalytics
 				// sustained outage. 3 makes one bad tick enough to trip it.
 				MinimumThroughput = 3,
 				SamplingDuration = TimeSpan.FromSeconds(10),
-				BreakDuration = TimeSpan.FromSeconds(5)
+				BreakDuration = breakDuration ?? TimeSpan.FromSeconds(5)
 			};
 
 			var builder = new ResiliencePipelineBuilder<BatchSendResult>
@@ -349,6 +385,11 @@ namespace DesktopAnalytics
 			{
 				if (_spool == null)
 					return;
+
+				// Age-based retention floor: cheap to run every tick since it stops at the first
+				// non-expired entry (see EventSpool.TrimExpired's doc comment).
+				_spool.TrimExpired(TimeSpan.FromDays(kDefaultMaxSpoolAgeDays), _timeProvider.GetUtcNow());
+
 				await _spool.ProcessBatchAsync(_batchSize,
 						(batch, ct) => SendBatchGuardedAsync(batch, ct, usePipeline),
 						kMaxBytesPerDrainTick, cancellationToken)
@@ -471,6 +512,17 @@ namespace DesktopAnalytics
 
 			try
 			{
+				// Defense-in-depth against the same consent-revocation race described on
+				// Analytics.AllowTracking's setter: PurgeQueuedEvents (via PauseTimer) sets
+				// _paused = true BEFORE it cancels the in-flight send and purges the spool, so a
+				// concurrent Track() that observes _paused here cannot enqueue an event that would
+				// survive the purge. This closes almost all of the residual race window down to the
+				// tiny gap between PauseTimer() setting _paused and this read of it -- fully
+				// eliminating that last sliver would require a lock spanning both the flag check
+				// and the enqueue call, which isn't justified here given how small the window is.
+				if (_paused)
+					return;
+
 				if (_spool == null)
 					return;
 
@@ -624,15 +676,24 @@ namespace DesktopAnalytics
 		/// <summary>
 		/// Bounded drain, then release the spool's cross-process lock. Never hangs, even fully
 		/// offline: undelivered events simply remain on disk for the next launch to pick up.
-		/// Never faults, and is idempotent -- a redundant <see cref="ShutDown"/> (e.g. Dispose on
-		/// the <see cref="Analytics"/> facade after an explicit ShutDownAsync) finds a stopped
-		/// timer, an empty-reporting spool, and a no-op re-Dispose.
+		/// Never faults, and is genuinely idempotent -- guarded by an internal
+		/// <c>Interlocked.Exchange</c> so only the first call (even if concurrent) runs the
+		/// shutdown body; a redundant call (e.g. Dispose on the <see cref="Analytics"/> facade
+		/// after an explicit ShutDownAsync) is an immediate no-op rather than re-entering the
+		/// drain against an already-disposed spool/sender.
 		/// </summary>
 		/// <param name="cancellationToken">Optionally ends the final drain even sooner than its own
 		/// wall-clock bound; undelivered events stay on disk. The spool's lock is released either
 		/// way, and cancellation never faults the task.</param>
 		public async Task ShutDownAsync(CancellationToken cancellationToken = default)
 		{
+			// Make the "idempotent" guarantee in this method's doc comment actually true rather
+			// than accidental: only the FIRST call (even under concurrent callers) runs the body
+			// below. Every subsequent call is an immediate no-op instead of re-entering
+			// BoundedDrainAsync / ProcessBatchAsync against a spool that may already be disposed.
+			if (Interlocked.Exchange(ref _shutDownState, 1) != 0)
+				return;
+
 			try
 			{
 				StopTimerPermanently();
@@ -651,6 +712,23 @@ namespace DesktopAnalytics
 				catch (Exception e)
 				{
 					Debug.WriteLine("MixpanelClient.ShutDown: failed to dispose spool: " + e);
+				}
+				finally
+				{
+					_spool = null;
+				}
+
+				try
+				{
+					(_sender as IDisposable)?.Dispose();
+				}
+				catch (Exception e)
+				{
+					Debug.WriteLine("MixpanelClient.ShutDown: failed to dispose sender: " + e);
+				}
+				finally
+				{
+					_sender = null;
 				}
 			}
 		}
@@ -691,9 +769,11 @@ namespace DesktopAnalytics
 
 		// Aborts whatever timer-driven send is currently in flight (if any) so Purge() does not block
 		// behind a network round trip and the in-flight batch rolls back into the spool -- where the
-		// impending Purge() removes it -- instead of being delivered to Mixpanel after consent was
-		// just revoked. Swaps in a fresh, non-canceled token so the NEXT drain (post-purge, or after
-		// ResumeSending) is unaffected.
+		// impending Purge() removes it -- rather than being resent/kept around locally after consent
+		// was just revoked. This best-effort cancellation reduces, but cannot eliminate, the window:
+		// it cannot recall a POST body Mixpanel's server already fully received before the local await
+		// observed cancellation. Swaps in a fresh, non-canceled token so the NEXT drain (post-purge, or
+		// after ResumeSending) is unaffected.
 		private void CancelInFlightSend()
 		{
 			var previous = Interlocked.Exchange(ref _sendCts, new CancellationTokenSource());

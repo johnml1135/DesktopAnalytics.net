@@ -766,6 +766,13 @@ namespace DesktopAnalytics
 				if (value == s_allowTracking)
 					return;
 
+				// Flip the flag FIRST, before any of the branching/purge logic below, so a
+				// concurrent Track()/ReportException() (which reads AllowTracking) observes the
+				// new value immediately. This shrinks the window in which a thread could still see
+				// AllowTracking == true (and enqueue an event) while a consent-revocation purge
+				// below is in progress or about to start.
+				s_allowTracking = value;
+
 				// The following is not strictly thread safe because another thread could set this
 				// after the singleton is created but before it checks the flag to decide whether
 				// to complete initialization based on the value of the flag. In practice, the
@@ -811,8 +818,6 @@ namespace DesktopAnalytics
 						Debug.WriteLine("Analytics.AllowTracking: PurgeQueuedEvents failed: " + e);
 					}
 				}
-
-				s_allowTracking = value;
 			}
 		}
 

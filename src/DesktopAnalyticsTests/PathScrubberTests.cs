@@ -113,5 +113,52 @@ namespace DesktopAnalyticsTests
 			StringAssert.Contains("%USER%\\repo\\File0.cs", result);
 			StringAssert.Contains("%USER%\\repo\\File499.cs", result);
 		}
+
+		[Test]
+		public void Scrub_WindowsPath_NoTrailingSeparatorAtEndOfString_ReplacesUserSegment()
+		{
+			const string input = @"Access denied: C:\Users\jsmith";
+			const string expected = "Access denied: %USER%";
+			Assert.AreEqual(expected, PathScrubber.Scrub(input));
+		}
+
+		[Test]
+		public void Scrub_WindowsPath_ForwardSlashes_ReplacesUserSegmentPreservingSlash()
+		{
+			const string input = @"C:/Users/jsmith/file.txt";
+			const string expected = "%USER%/file.txt";
+			Assert.AreEqual(expected, PathScrubber.Scrub(input));
+		}
+
+		[Test]
+		public void Scrub_UncPath_ReplacesUserSegment()
+		{
+			const string input = @"\\fileserver\Users\jsmith\Documents\file.txt";
+			const string expected = @"%USER%\Documents\file.txt";
+			Assert.AreEqual(expected, PathScrubber.Scrub(input));
+		}
+
+		[Test]
+		public void Scrub_UncPath_NoTrailingSeparatorAtEndOfString_ReplacesUserSegment()
+		{
+			const string input = @"\\fileserver\Users\jsmith";
+			const string expected = "%USER%";
+			Assert.AreEqual(expected, PathScrubber.Scrub(input));
+		}
+
+		[Test]
+		public void Scrub_UnixPath_NoTrailingSeparatorAtEndOfString_ReplacesUserSegment()
+		{
+			const string input = "/home/jsmith";
+			const string expected = "%USER%";
+			Assert.AreEqual(expected, PathScrubber.Scrub(input));
+		}
+
+		[Test]
+		public void Scrub_WindowsPathWithNoUsersSegment_ReturnsInputUnchanged()
+		{
+			const string input = @"D:\Projects\MyApp";
+			Assert.AreEqual(input, PathScrubber.Scrub(input));
+		}
 	}
 }

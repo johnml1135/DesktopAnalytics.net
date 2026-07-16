@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using DesktopAnalytics;
@@ -124,6 +126,27 @@ namespace DesktopAnalyticsTests
 					}
 				}
 				return BatchSendResult.Retryable;
+			}
+		}
+
+		// Blocks inside SendBatchAsync until the test explicitly releases it (via a
+		// TaskCompletionSource, not a real delay), so a test can precisely control when an
+		// in-flight drain's network call "returns" -- used to race concurrent Track() calls against
+		// an in-progress drain deterministically and quickly.
+		private class BlockingUntilSignaledSender : IEventSender
+		{
+			private readonly TaskCompletionSource<bool> _release =
+				new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+			public int CallCount;
+
+			public void Release() => _release.TrySetResult(true);
+
+			public async Task<BatchSendResult> SendBatchAsync(IReadOnlyList<AnalyticsEvent> events,
+				CancellationToken cancellationToken = default)
+			{
+				Interlocked.Increment(ref CallCount);
+				await _release.Task.ConfigureAwait(false);
+				return new BatchSendResult(SendResult.Delivered);
 			}
 		}
 
@@ -253,7 +276,18 @@ namespace DesktopAnalyticsTests
 			var client = new MixpanelClient();
 			client.InitializeForTest(null, new AlwaysResultSender(SendResult.Delivered));
 
+			Assert.IsFalse(client.SendingPaused, "test setup: should start unpaused");
+
 			Assert.DoesNotThrow(() => client.PurgeQueuedEvents());
+
+			// Statistics must be untouched -- there was never any spool to purge anything from.
+			Assert.AreEqual(0, client.Statistics.Submitted);
+			Assert.AreEqual(0, client.Statistics.Succeeded);
+			Assert.AreEqual(0, client.Statistics.Failed);
+			// The flush loop must still pause even with no spool -- PurgeQueuedEvents' PauseTimer()
+			// call does not depend on there being a spool to actually purge.
+			Assert.IsTrue(client.SendingPaused,
+				"PurgeQueuedEvents must still pause the flush loop even with no spool");
 		}
 
 		// ---- SCRUBBING --------------------------------------------------------------------------
@@ -402,11 +436,23 @@ namespace DesktopAnalyticsTests
 			client.InitializeForTest(null, new AlwaysResultSender(SendResult.Delivered));
 
 			Assert.DoesNotThrow(() => client.Track("user-1", "Save", null));
+			// Track() must return (as a no-op) before it ever counts the event as submitted --
+			// distinct from Track_WithoutInitialize_ThrowsInvalidOperationException, where a
+			// never-initialized client is a programming error rather than a "no spool" no-op.
+			Assert.AreEqual(0, client.Statistics.Submitted,
+				"Track() with no spool must not count the event as submitted at all");
+
 			Assert.DoesNotThrowAsync(async () => await client.DrainOnceAsync());
 			Assert.DoesNotThrow(() => client.Flush());
 			Assert.DoesNotThrowAsync(async () => await client.FlushAsync());
 			Assert.DoesNotThrowAsync(async () => await client.ShutDownAsync());
 			Assert.DoesNotThrow(() => client.ShutDown());
+
+			// None of the above should have moved the needle: with no spool, there is nothing to
+			// drain/flush/shut down, so the statistics must still read exactly as they started.
+			Assert.AreEqual(0, client.Statistics.Submitted);
+			Assert.AreEqual(0, client.Statistics.Succeeded);
+			Assert.AreEqual(0, client.Statistics.Failed);
 		}
 
 		[Test]
@@ -892,6 +938,78 @@ namespace DesktopAnalyticsTests
 			}
 		}
 
+		// Breaker recovery: half-open -> closed. Once the circuit breaker has tripped (same
+		// single-fully-failing-tick recipe as the regression test above), let its BreakDuration
+		// elapse and drive a successful send, proving delivery resumes rather than the breaker
+		// staying open forever.
+		//
+		// This uses the real TimeProvider.System (not a FakeTimeProvider) for the pipeline's clock,
+		// exactly like the other real-circuit-breaker tests above, and shrinks BreakDuration itself
+		// (via BuildDefaultPipeline's breakDuration parameter) so this test can wait out the break
+		// for real, quickly -- rather than driving a FakeTimeProvider through Polly, which is
+		// documented (Polly #1932, see offline-analytics.md's "Polly" section) to need extra
+		// ceremony (nulling the SynchronizationContext / ConfigureAwait(true)) or retries silently
+		// don't fire.
+		[Test]
+		public async Task DrainOnce_WithRealCircuitBreaker_AfterBreakDurationElapses_HalfOpenTrialSucceedsAndClosesBreaker()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				var shortBreakDuration = TimeSpan.FromMilliseconds(600);
+				var failingSender = new AlwaysResultSender(SendResult.RetryableFailure);
+				var pipeline = MixpanelClient.BuildDefaultPipeline(TimeProvider.System,
+					retryDelay: TimeSpan.Zero, breakDuration: shortBreakDuration);
+
+				var client = new MixpanelClient();
+				// Deliberately NOT overriding batchSize here (unlike the regression test above):
+				// tripping only depends on the retry pipeline producing enough outcomes, not on
+				// batch size, and leaving it at the default means the half-open trial below gathers
+				// BOTH events still queued at that point (the rolled-back "Save" and "StillOpen")
+				// into a single batch, matching the ApproximateCount assertions below.
+				client.InitializeForTest(spool, failingSender, pipeline: pipeline);
+
+				// Trip the breaker: one fully-failing tick produces 3 outcomes (1 attempt + the
+				// default MaxRetryAttempts=2 retries), enough to satisfy MinimumThroughput=3 on its
+				// own (see the regression test above for why this is exactly 3, not 4).
+				client.Track("user-1", "Save", null);
+				await client.DrainOnceAsync();
+				var callsWhileTripping = failingSender.CallCount;
+				Assert.GreaterOrEqual(callsWhileTripping, 3);
+
+				// While still within BreakDuration, the breaker must still be open: a further drain
+				// must not even reach the sender.
+				client.Track("user-1", "StillOpen", null);
+				await client.DrainOnceAsync();
+				Assert.AreEqual(callsWhileTripping, failingSender.CallCount,
+					"the breaker must still be open immediately after tripping");
+
+				// Let BreakDuration elapse for real (short on purpose, see shortBreakDuration above,
+				// so this test stays fast), then swap in a succeeding sender on the SAME client /
+				// spool / pipeline instance -- exactly the pattern the crash-window dedup test above
+				// uses to swap senders mid-test -- so the breaker's own state carries over.
+				await Task.Delay(shortBreakDuration + TimeSpan.FromMilliseconds(400));
+
+				var succeedingSender = new AlwaysResultSender(SendResult.Delivered);
+				client.InitializeForTest(spool, succeedingSender, pipeline: pipeline);
+
+				await client.DrainOnceAsync(); // The half-open trial: gathers BOTH queued events.
+
+				Assert.AreEqual(1, succeedingSender.CallCount,
+					"once BreakDuration has elapsed, the half-open trial must reach the sender");
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"the trial batch (both events still queued: the rolled-back Save and StillOpen) " +
+					"succeeded and must be fully delivered");
+
+				// And the breaker should now be fully closed: a further event flows through normally,
+				// with no special handling.
+				client.Track("user-1", "AfterRecovery", null);
+				await client.DrainOnceAsync();
+
+				Assert.AreEqual(2, succeedingSender.CallCount);
+				Assert.AreEqual(0, spool.ApproximateCount);
+			}
+		}
+
 		// ---- CONTRACT: host parameter is rejected (Mixpanel does not support a host) -----------
 
 		[Test]
@@ -920,6 +1038,31 @@ namespace DesktopAnalyticsTests
 
 				client.ResumeSending();
 				Assert.IsFalse(client.SendingPaused, "re-granting consent (resume) must un-pause the flush loop");
+			}
+		}
+
+		// Defense-in-depth: Track() itself must no-op while _paused (consent revoked), not just
+		// rely on the caller (Analytics.TrackWithApplicationProperties) checking AllowTracking
+		// first. Covers the residual race window between a consent revocation observed by
+		// PurgeQueuedEvents/PauseTimer and a concurrent Track() call that a caller-side check alone
+		// cannot close.
+		[Test]
+		public void Track_WhileSendingPaused_DoesNotEnqueue()
+		{
+			using (var spool = new EventSpool(_spoolDir, 10))
+			{
+				var client = new MixpanelClient();
+				client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
+
+				client.PurgeQueuedEvents();
+				Assert.IsTrue(client.SendingPaused, "test setup: client must be paused before Track is called");
+
+				client.Track("user-1", "ShouldNotEnqueue", null);
+
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"Track() must not enqueue while the flush loop is paused (consent revoked)");
+				Assert.AreEqual(0, client.Statistics.Submitted,
+					"a Track() call while paused must not even count as submitted");
 			}
 		}
 
@@ -962,6 +1105,92 @@ namespace DesktopAnalyticsTests
 				Assert.AreEqual(0, spool.ApproximateCount,
 					"purge must remove the batch that was in flight when consent was revoked, not " +
 					"leave it to be delivered afterward");
+			}
+		}
+
+		// ---- CONCURRENCY: Track() racing an in-progress drain ------------------------------------
+
+		// Stress/regression coverage for EventSpool._sync serialization: while a drain's send is
+		// genuinely in flight (blocked, via BlockingUntilSignaledSender, until this test releases
+		// it -- never a real Thread.Sleep-style delay), several threads call Track() concurrently.
+		// This does not assert a specific interleaving -- only that nothing throws, nothing
+		// deadlocks, and the bookkeeping (Submitted == Succeeded + Failed + still-spooled) stays
+		// internally consistent once everything settles.
+		[Test]
+		public async Task ConcurrentTrack_WhileDrainInProgress_NoExceptionsAndConsistentFinalState()
+		{
+			using (var spool = new EventSpool(_spoolDir, 1000))
+			{
+				var sender = new BlockingUntilSignaledSender();
+				var client = new MixpanelClient();
+				client.InitializeForTest(spool, sender, batchSize: 5);
+
+				// Seed one event so the drain below has something to gather and actually calls the
+				// (blocking) sender.
+				client.Track("user-1", "Seed", null);
+
+				var drainTask = client.DrainOnceAsync(); // Blocks inside the sender until Release().
+
+				// Wait for the send to actually start, so the concurrent Track() calls below
+				// genuinely race an in-flight drain (EventSpool._sync held across the network await)
+				// rather than running before the drain even begins.
+				var deadline = DateTime.UtcNow.AddSeconds(5);
+				while (sender.CallCount == 0 && DateTime.UtcNow < deadline)
+					await Task.Delay(10);
+				Assert.AreEqual(1, sender.CallCount,
+					"the drain's send must have started before the concurrent Track() calls below");
+
+				const int threadCount = 4;
+				const int perThread = 25;
+				var exceptions = new ConcurrentBag<Exception>();
+				var threads = new Thread[threadCount];
+				for (var t = 0; t < threadCount; t++)
+				{
+					var threadIndex = t;
+					threads[t] = new Thread(() =>
+					{
+						try
+						{
+							for (var i = 0; i < perThread; i++)
+								client.Track("user-1", $"T{threadIndex}-{i}", null);
+						}
+						catch (Exception e)
+						{
+							exceptions.Add(e);
+						}
+					});
+				}
+
+				foreach (var thread in threads)
+					thread.Start();
+
+				// Release the blocked send BEFORE joining, not after: EventSpool._sync is held for
+				// the whole drain (including across this send), so every one of the Track() threads
+				// above piles up waiting on it -- joining first would deadlock forever waiting for
+				// threads that can only make progress once the send (and thus the lock) is released.
+				sender.Release();
+
+				foreach (var thread in threads)
+					thread.Join();
+				await drainTask;
+
+				Assert.IsEmpty(exceptions, "no Track() call racing an in-flight drain should throw");
+
+				var expectedSubmitted = 1 + threadCount * perThread;
+				Assert.AreEqual(expectedSubmitted, client.Statistics.Submitted,
+					"every Track() call (the seed plus every concurrent one) must be counted submitted");
+				Assert.AreEqual(expectedSubmitted,
+					client.Statistics.Succeeded + client.Statistics.Failed + spool.ApproximateCount,
+					"every submitted event must be accounted for as succeeded, failed, or still spooled " +
+					"-- concurrent access must not corrupt that invariant");
+
+				// Drain the rest so the final state is fully resolved.
+				while (spool.ApproximateCount > 0)
+					await client.DrainOnceAsync();
+
+				Assert.AreEqual(0, spool.ApproximateCount);
+				Assert.AreEqual(expectedSubmitted, client.Statistics.Succeeded);
+				Assert.AreEqual(0, client.Statistics.Failed);
 			}
 		}
 	}
