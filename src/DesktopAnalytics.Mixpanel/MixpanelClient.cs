@@ -25,7 +25,7 @@ namespace DesktopAnalytics
 	/// escape to the caller either; it just leaves this client running with no spool (Track/Drain
 	/// become no-ops) rather than durable.
 	/// </remarks>
-	internal class MixpanelClient : IClient
+	public class MixpanelClient : IClient
 	{
 		// Open questions in offline-analytics.md: exact cap/batch/cadence values are not locked yet.
 		// These are reasonable starting defaults, not requirements baked in elsewhere.

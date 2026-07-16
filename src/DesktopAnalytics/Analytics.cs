@@ -86,7 +86,9 @@ namespace DesktopAnalytics
 		/// <param name="allowTracking">If false, this will not do any communication with segment.io</param>
 		/// <param name="retainPii">If false, userInfo will be stripped/hashed/adjusted to prevent
 		/// communication of personally identifiable information to the analytics server.</param>
-		/// <param name="clientType"><see cref="ClientType"/></param>
+		/// <param name="client">The <see cref="IClient"/> to use, e.g. a <see cref="SegmentClient"/>
+		/// or a Mixpanel client from the separate SIL.DesktopAnalytics.Mixpanel package. If null,
+		/// defaults to a new <see cref="SegmentClient"/>.</param>
 		/// <param name="host">The url of the host to send analytics to. Will use the client's
 		/// default if not provided. Throws an ArgumentException if the client does not support
 		/// setting the host.</param>
@@ -100,7 +102,7 @@ namespace DesktopAnalytics
 			UserInfo userInfo,
 			bool allowTracking = true,
 			bool retainPii = false,
-			ClientType clientType = ClientType.Segment,
+			IClient client = null,
 			string host = null,
 			bool useCallingAssemblyVersion = false) : this(
 				apiSecret,
@@ -108,7 +110,7 @@ namespace DesktopAnalytics
 				new Dictionary<string, string>(),
 				allowTracking,
 				retainPii,
-				clientType,
+				client,
 				host,
 				assemblyToUseForVersion: useCallingAssemblyVersion ? GetCallingAssembly() : null
 			)
@@ -148,7 +150,9 @@ namespace DesktopAnalytics
 		/// <param name="allowTracking">If false, prevents communication with segment.io</param>
 		/// <param name="retainPii">If false, userInfo will be stripped/hashed/adjusted to prevent
 		/// communication of personally identifiable information to the analytics server.</param>
-		/// <param name="clientType"><see cref="ClientType"/></param>
+		/// <param name="client">The <see cref="IClient"/> to use, e.g. a <see cref="SegmentClient"/>
+		/// or a Mixpanel client from the separate SIL.DesktopAnalytics.Mixpanel package. If null,
+		/// defaults to a new <see cref="SegmentClient"/>.</param>
 		/// <param name="host">The url of the host to send analytics to. Will use the client's
 		/// default if not provided. Throws an ArgumentException if the client does not support
 		/// setting the host.</param>
@@ -166,7 +170,7 @@ namespace DesktopAnalytics
 			Dictionary<string, string> propertiesThatGoWithEveryEvent,
 			bool allowTracking = true,
 			bool retainPii = false,
-			ClientType clientType = ClientType.Segment,
+			IClient client = null,
 			string host = null,
 			int flushAt = -1,
 			int flushInterval = -1,
@@ -179,25 +183,11 @@ namespace DesktopAnalytics
 			}
 			s_singleton = this;
 
-			switch (clientType)
-			{
-				case ClientType.Segment:
-				{
-					var segmentClient = new SegmentClient();
-					segmentClient.Failed += Client_Failed;
-					_client = segmentClient;
-					break;
-				}
-				case ClientType.Mixpanel:
-				{
-					_client = new MixpanelClient();
-					break;
-				}
-				default:
-				{
-					throw new ArgumentException("Unknown client type", nameof(clientType));
-				}
-			}
+			if (client == null)
+				client = new SegmentClient();
+			if (client is SegmentClient segmentClient)
+				segmentClient.Failed += Client_Failed;
+			_client = client;
 			_propertiesThatGoWithEveryEvent = propertiesThatGoWithEveryEvent;
 
 			s_userInfo = retainPii ? userInfo : userInfo.CreateSanitized();

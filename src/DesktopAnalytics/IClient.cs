@@ -4,7 +4,14 @@ using Segment.Serialization;
 
 namespace DesktopAnalytics
 {
-	internal interface IClient
+	/// <summary>
+	/// The seam between <see cref="Analytics"/> and a concrete analytics transport. Core ships
+	/// <see cref="SegmentClient"/>; a Mixpanel implementation (<c>MixpanelClient</c>) is provided by
+	/// the separate <c>SIL.DesktopAnalytics.Mixpanel</c> package -- core has no compile-time
+	/// reference to it. Construct whichever client you want and pass it to one of the
+	/// <see cref="Analytics"/> constructors.
+	/// </summary>
+	public interface IClient
 	{
 		void Initialize(string apiSecret, string host = null, int flushAt = -1, int flushInterval = -1);
 		void ShutDown();
@@ -15,7 +22,7 @@ namespace DesktopAnalytics
 		/// <summary>
 		/// Async counterpart of <see cref="ShutDown"/>. Implementations whose shutdown has nothing
 		/// awaitable (see <see cref="SegmentClient"/>) may complete synchronously; implementations
-		/// with real async delivery work (see <see cref="MixpanelClient"/>) must never block a
+		/// with real async delivery work (e.g. <c>MixpanelClient</c>) must never block a
 		/// thread waiting on it. Like every member here, must not throw -- including on
 		/// cancellation, which just ends any in-flight delivery early (events stay queued).
 		/// </summary>
@@ -31,8 +38,8 @@ namespace DesktopAnalytics
 
 		/// <summary>
 		/// Called when the user revokes tracking consent (<see cref="Analytics.AllowTracking"/>
-		/// transitioning to false). Implementations that spool events on disk (see
-		/// <see cref="MixpanelClient"/>) must purge that spool immediately; implementations without a
+		/// transitioning to false). Implementations that spool events on disk (e.g.
+		/// <c>MixpanelClient</c>) must purge that spool immediately; implementations without a
 		/// local spool (see <see cref="SegmentClient"/>) can no-op.
 		/// </summary>
 		void PurgeQueuedEvents();
@@ -40,8 +47,8 @@ namespace DesktopAnalytics
 		/// <summary>
 		/// Called when the user grants tracking consent again (<see cref="Analytics.AllowTracking"/>
 		/// transitioning back to true) on an already-initialized client, after a prior
-		/// <see cref="PurgeQueuedEvents"/> paused it. Implementations with a background flush loop (see
-		/// <see cref="MixpanelClient"/>) must re-arm it; implementations without one (see
+		/// <see cref="PurgeQueuedEvents"/> paused it. Implementations with a background flush loop
+		/// (e.g. <c>MixpanelClient</c>) must re-arm it; implementations without one (see
 		/// <see cref="SegmentClient"/>) can no-op.
 		/// </summary>
 		void ResumeSending();

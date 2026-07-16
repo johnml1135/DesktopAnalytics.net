@@ -19,7 +19,12 @@ namespace SampleApp
 				return 1;
 			}
 
-			if (!Enum.TryParse<ClientType>(args[1], true, out var clientType))
+			IClient client;
+			if (args[1].Equals("Segment", StringComparison.OrdinalIgnoreCase))
+				client = new SegmentClient();
+			else if (args[1].Equals("Mixpanel", StringComparison.OrdinalIgnoreCase))
+				client = new MixpanelClient();
+			else
 			{
 				Console.WriteLine($"{usage}{Environment.NewLine}Unrecognized client type: {args[1]}");
 				return 1;
@@ -79,7 +84,7 @@ namespace SampleApp
 				"This is a really long explanation of how I use this product to see how much you would be able to extract from Mixpanel.\r\nAnd a second line of it.");
 
 			var propsForEveryEvent = new Dictionary<string, string> {{"channel", "beta"}};
-			using (new Analytics(args[0], userInfo, propsForEveryEvent, initialTracking, clientType: clientType))
+			using (new Analytics(args[0], userInfo, propsForEveryEvent, initialTracking, client: client))
 			{
 				Thread.Sleep(3000);
 				//note that anything we set from here on didn't make it into the initial "Launch" event. Things we want to 

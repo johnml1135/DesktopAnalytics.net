@@ -7,7 +7,12 @@ using Segment.Serialization;
 
 namespace DesktopAnalytics
 {
-	internal class SegmentClient : IClient, ICoroutineExceptionHandler
+	/// <summary>
+	/// <see cref="IClient"/> implementation backed by Segment.Analytics.CSharp. Constructible
+	/// directly by callers who want to pass it explicitly to an <see cref="Analytics"/>
+	/// constructor; also the implicit default when no <see cref="IClient"/> is supplied.
+	/// </summary>
+	public class SegmentClient : IClient, ICoroutineExceptionHandler
 	{
 		public event Action<Exception> Failed;
 		private Segment.Analytics.Analytics _analytics;
