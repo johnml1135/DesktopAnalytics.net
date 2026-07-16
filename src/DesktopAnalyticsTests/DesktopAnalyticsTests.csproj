@@ -1,7 +1,7 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
 <PropertyGroup>
-	<TargetFramework>net462</TargetFramework>
+	<TargetFrameworks>net462;net8.0</TargetFrameworks>
 	<IsPackable>false</IsPackable>
 	<Company>SIL International</Company>
 	<SignAssembly>False</SignAssembly>
@@ -21,7 +21,7 @@
 <ItemGroup>
   <ProjectReference Include="..\DesktopAnalytics\DesktopAnalytics.csproj" />
 </ItemGroup>
-<ItemGroup>
+<ItemGroup Condition="'$(TargetFramework)' == 'net462'">
   <Reference Include="System.Configuration" />
 </ItemGroup>
 </Project>

@@ -1,7 +1,7 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
 <PropertyGroup>
-	<TargetFramework>net462</TargetFramework>
+	<TargetFrameworks>net462;netstandard2.0;net8.0</TargetFrameworks>
 	<PackageId>SIL.DesktopAnalytics</PackageId>
 	<Authors>John Hatton, Stephen McConnel, Tom Bogle, Eberhard Beilharz, John Thomson, Andrew Polk, Jason Naylor</Authors>
 	<Company>SIL International</Company>
@@ -18,12 +18,19 @@
 </PropertyGroup>
 <ItemGroup>
     <PackageReference Include="DiskQueue" Version="1.7.2" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
     <PackageReference Include="JetBrains.Annotations" Version="2023.2.0">
       <PrivateAssets>All</PrivateAssets>
     </PackageReference>
+    <!-- Kept unconditional (incl. net8.0) even though TimeProvider itself is in-box there: MixpanelClient
+         uses this package's CreateCancellationTokenSource extension method, which is not in-box. -->
     <PackageReference Include="Microsoft.Bcl.TimeProvider" Version="8.0.0" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.1.1" PrivateAssets="All" />
     <PackageReference Include="Polly" Version="8.4.2" />
+</ItemGroup>
+<ItemGroup>
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="8.0.0" Condition="'$(TargetFramework)' != 'net462'" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" Condition="'$(TargetFramework)' != 'net8.0'" />
 </ItemGroup>
 <ItemGroup>
   <PackageReference Include="mixpanel-csharp" Version="6.0.0" />
@@ -34,10 +41,11 @@
   </PackageReference>
   <PackageReference Include="Segment.Analytics.CSharp" Version="2.3.0" />
 </ItemGroup>
-<ItemGroup>
+<ItemGroup Condition="'$(TargetFramework)' == 'net462'">
   <Reference Include="System.Configuration" />
 </ItemGroup>
 <ItemGroup>
+  <Compile Remove="AnalyticsSettings.Designer.cs" Condition="'$(TargetFramework)' != 'net462'" />
   <Compile Update="AnalyticsSettings.Designer.cs">
     <DesignTime>True</DesignTime>
     <AutoGen>True</AutoGen>

@@ -84,7 +84,7 @@ namespace DesktopAnalytics
 		private static readonly TimeSpan s_boundedDrainDuration = TimeSpan.FromSeconds(5);
 		private const int kBoundedDrainMaxAttempts = 20;
 
-		private EventSpool _spool;
+		private IEventSpool _spool;
 		private IEventSender _sender;
 		private TimeProvider _timeProvider = TimeProvider.System;
 		private ResiliencePipeline<BatchSendResult> _pipeline = ResiliencePipeline<BatchSendResult>.Empty;
@@ -194,7 +194,7 @@ namespace DesktopAnalytics
 		/// retry/circuit-breaker behavior pass their own pipeline (see
 		/// <see cref="BuildDefaultPipeline"/>).</param>
 		internal void InitializeForTest(
-			EventSpool spool,
+			IEventSpool spool,
 			IEventSender sender,
 			TimeProvider timeProvider = null,
 			ResiliencePipeline<BatchSendResult> pipeline = null,

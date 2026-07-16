@@ -46,7 +46,7 @@ namespace DesktopAnalytics
 	/// the underlying DiskQueue's cross-process exclusive lock is a startup-time condition the
 	/// caller needs to know about, so it is allowed to propagate.
 	/// </remarks>
-	internal class EventSpool : IDisposable
+	internal class EventSpool : IEventSpool
 	{
 		// How long we wait to acquire DiskQueue's cross-process exclusive lock when opening the
 		// spool. Kept short: if another process is holding the lock for this long, something is
@@ -388,9 +388,9 @@ namespace DesktopAnalytics
 			}
 		}
 
-		// Test seam: the spool's current logical byte total (the value the byte cap is enforced
-		// against), primarily so tests can prove it survives a dispose/reopen.
-		internal long ApproximateBytes
+		// The spool's current logical byte total (the value the byte cap is enforced against).
+		// Also a test seam: tests use it to prove the total survives a dispose/reopen.
+		public long ApproximateBytes
 		{
 			get
 			{

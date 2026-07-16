@@ -60,6 +60,12 @@ namespace DesktopAnalytics
 		private readonly Dictionary<string, string> _propertiesThatGoWithEveryEvent;
 		private static int s_exceptionCount = 0;
 
+#if NET462
+		private static readonly IAnalyticsSettingsStore s_settings = new NetFrameworkAnalyticsSettingsStore();
+#else
+		private static readonly IAnalyticsSettingsStore s_settings = new JsonAnalyticsSettingsStore();
+#endif
+
 		private class InitializationParameters
 		{
 			public string ApiSecret;
@@ -129,7 +135,7 @@ namespace DesktopAnalytics
 			if (!AllowTracking && !initializing)
 				return;
 
-			_client.Identify(AnalyticsSettings.Default.IdForAnalytics, s_traits, s_locationInfo);
+			_client.Identify(s_settings.IdForAnalytics, s_traits, s_locationInfo);
 		}
 
 		/// <summary>
@@ -222,13 +228,13 @@ namespace DesktopAnalytics
 		private void Initialize(InitializationParameters parameters)
 		{
 			// Bring in settings from any previous version.
-			if (AnalyticsSettings.Default.NeedUpgrade)
+			if (s_settings.NeedUpgrade)
 			{
 				//see http://stackoverflow.com/questions/3498561/net-applicationsettingsbase-should-i-call-upgrade-every-time-i-load
 				try
 				{
-					AnalyticsSettings.Default.Upgrade();
-					AnalyticsSettings.Default.NeedUpgrade = false;
+					s_settings.Upgrade();
+					s_settings.NeedUpgrade = false;
 					TrySaveSettings();
 				}
 				catch (ConfigurationErrorsException e)
@@ -244,7 +250,7 @@ namespace DesktopAnalytics
 				}
 			}
 
-			if (IsNullOrEmpty(AnalyticsSettings.Default.IdForAnalytics))
+			if (IsNullOrEmpty(s_settings.IdForAnalytics))
 			{
 				// Apparently a first-time installation. If possible, we really want to use the
 				// same ID (from another channel of this app) to keep our statistics valid.
@@ -265,9 +271,9 @@ namespace DesktopAnalytics
 				parameters.FlushInterval
 			);
 
-			if (IsNullOrEmpty(AnalyticsSettings.Default.IdForAnalytics))
+			if (IsNullOrEmpty(s_settings.IdForAnalytics))
 			{
-				AnalyticsSettings.Default.IdForAnalytics = Guid.NewGuid().ToString();
+				s_settings.IdForAnalytics = Guid.NewGuid().ToString();
 				TrySaveSettings();
 			}
 
@@ -300,18 +306,18 @@ namespace DesktopAnalytics
 			// unlikely event that they do, it's not the end of the world.
 			s_allowTracking = true;
 
-			if (IsNullOrEmpty(AnalyticsSettings.Default.LastVersionLaunched))
+			if (IsNullOrEmpty(s_settings.LastVersionLaunched))
 			{
 				// "Created" is a special property that segment.io understands and coverts to
 				// equivalents in various analytics services. So it's not as descriptive for us as
 				// "FirstLaunchOnSystem", but it will give the best experience on the analytics sites.
 				TrackWithApplicationProperties("Created");
 			}
-			else if (AnalyticsSettings.Default.LastVersionLaunched != versionNumberWithBuild)
+			else if (s_settings.LastVersionLaunched != versionNumberWithBuild)
 			{
 				TrackWithApplicationProperties("Upgrade", new JsonObject
 				{
-					{"OldVersion", AnalyticsSettings.Default.LastVersionLaunched},
+					{"OldVersion", s_settings.LastVersionLaunched},
 				});
 			}
 
@@ -319,7 +325,7 @@ namespace DesktopAnalytics
 			// but that is done after we retrieve (or fail to retrieve) our external IP address.
 			// See http://issues.bloomlibrary.org/youtrack/issue/BL-4011.
 
-			AnalyticsSettings.Default.LastVersionLaunched = versionNumberWithBuild;
+			s_settings.LastVersionLaunched = versionNumberWithBuild;
 			TrySaveSettings();
 		}
 
@@ -330,7 +336,7 @@ namespace DesktopAnalytics
 			{
 				try
 				{
-					AnalyticsSettings.Default.Save();
+					s_settings.Save();
 					return;
 				}
 				catch (Exception e)
@@ -416,24 +422,24 @@ namespace DesktopAnalytics
 						string analyticsId = idSetting.Value;
 						if (IsNullOrEmpty(analyticsId))
 							continue;
-						AnalyticsSettings.Default.IdForAnalytics = analyticsId;
-						AnalyticsSettings.Default.FirstName = ExtractSetting(
-							AnalyticsSettings.Default.FirstName,
+						s_settings.IdForAnalytics = analyticsId;
+						s_settings.FirstName = ExtractSetting(
+							s_settings.FirstName,
 							doc,
 							"FirstName"
 						);
-						AnalyticsSettings.Default.LastName = ExtractSetting(
-							AnalyticsSettings.Default.LastName,
+						s_settings.LastName = ExtractSetting(
+							s_settings.LastName,
 							doc,
 							"LastName"
 						);
-						AnalyticsSettings.Default.LastVersionLaunched = ExtractSetting(
-							AnalyticsSettings.Default.LastVersionLaunched,
+						s_settings.LastVersionLaunched = ExtractSetting(
+							s_settings.LastVersionLaunched,
 							doc,
 							"LastVersionLaunched"
 						);
-						AnalyticsSettings.Default.Email = ExtractSetting(
-							AnalyticsSettings.Default.Email,
+						s_settings.Email = ExtractSetting(
+							s_settings.Email,
 							doc,
 							"Email"
 						);
@@ -1098,7 +1104,7 @@ namespace DesktopAnalytics
 			}
 
 			s_singleton._client.Track(
-				AnalyticsSettings.Default.IdForAnalytics,
+				s_settings.IdForAnalytics,
 				eventName,
 				properties
 			);
