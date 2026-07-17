@@ -17,7 +17,6 @@
     <AssemblyOriginatorKeyFile>..\..\DesktopAnalytics.snk</AssemblyOriginatorKeyFile>
 </PropertyGroup>
 <ItemGroup>
-    <PackageReference Include="DiskQueue" Version="1.7.2" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.1.1" PrivateAssets="All" />
     <PackageReference Include="Polly" Version="8.4.2" />

@@ -10,17 +10,11 @@ using NUnit.Framework;
 namespace DesktopAnalyticsTests
 {
 	/// <summary>
-	/// The storage-engine-agnostic <see cref="IEventSpool"/> contract, run against BOTH engines so
-	/// their behavior is compared rather than argued about. Engine-specific behavior (DiskQueue's
-	/// corrupt-file recovery and its exclusive cross-process lock; SQLite's WAL concurrency) stays
-	/// in each engine's own fixture.
+	/// The <see cref="IEventSpool"/> contract, run against the SQLite engine. Kept parametrized
+	/// over <typeparamref name="TFactory"/> (rather than collapsed to a concrete fixture) as a
+	/// low-risk leftover of when this ran against both DiskQueue- and SQLite-backed engines side
+	/// by side to prove they agreed; now there is exactly one <see cref="ISpoolFactory"/>.
 	/// </summary>
-	/// <remarks>
-	/// Overlaps EventSpoolTests by design while both engines are in the tree: this fixture proves
-	/// they agree, that one does not. Once an engine is chosen, the loser's fixture and this
-	/// parametrization both go away.
-	/// </remarks>
-	[TestFixture(typeof(DiskQueueSpoolFactory))]
 	[TestFixture(typeof(SqliteSpoolFactory))]
 	internal class EventSpoolContractTests<TFactory> where TFactory : ISpoolFactory, new()
 	{
@@ -569,14 +563,6 @@ namespace DesktopAnalyticsTests
 	{
 		string Name { get; }
 		IEventSpool Create(string dir, int maxItems, int maxItemBytes, long maxSpoolBytes);
-	}
-
-	internal class DiskQueueSpoolFactory : ISpoolFactory
-	{
-		public string Name => "DiskQueue";
-
-		public IEventSpool Create(string dir, int maxItems, int maxItemBytes, long maxSpoolBytes) =>
-			new EventSpool(dir, maxItems, maxItemBytes, maxSpoolBytes);
 	}
 
 	internal class SqliteSpoolFactory : ISpoolFactory

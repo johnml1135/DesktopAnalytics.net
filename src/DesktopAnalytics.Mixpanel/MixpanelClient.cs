@@ -13,14 +13,14 @@ namespace DesktopAnalytics
 {
 	/// <summary>
 	/// Durable Mixpanel client: events are scrubbed, stamped, and written to an on-disk
-	/// <see cref="EventSpool"/> immediately (never lost to being offline), and a background flush
-	/// loop drains the spool through a Polly-wrapped <see cref="IEventSender"/> whenever it can. See
-	/// offline-analytics.md for the design this implements.
+	/// <see cref="SqliteEventSpool"/> immediately (never lost to being offline), and a background
+	/// flush loop drains the spool through a Polly-wrapped <see cref="IEventSender"/> whenever it
+	/// can. See offline-analytics.md for the design this implements.
 	/// </summary>
 	/// <remarks>
 	/// Every public member here swallows exceptions and returns/no-ops rather than throwing --
 	/// analytics must never crash the host application (see offline-analytics.md, "Never crash the
-	/// host"). The one intentionally-not-swallowed failure is a bad <see cref="EventSpool"/>
+	/// host"). The one intentionally-not-swallowed failure is a bad <see cref="SqliteEventSpool"/>
 	/// constructor call inside <see cref="Initialize"/>, which is itself caught here so it cannot
 	/// escape to the caller either; it just leaves this client running with no spool (Track/Drain
 	/// become no-ops) rather than durable.
@@ -32,7 +32,7 @@ namespace DesktopAnalytics
 		//
 		// Sized to comfortably OUTLAST the 60-day age floor (kDefaultMaxSpoolAgeDays below) under
 		// realistic desktop-app usage-analytics volumes, rather than being the tightest bound in
-		// practice: EventSpool.TrimExpired's age-based eviction is meant to be what normally
+		// practice: SqliteEventSpool.TrimExpired's age-based eviction is meant to be what normally
 		// reclaims space from a long-offline backlog, not this item cap. At a generous ~200
 		// events/day of active use, 60 days is on the order of 12,000 events; 20,000 leaves
 		// headroom for bursty days (e.g. an exception storm) without the item cap kicking in well
@@ -64,7 +64,7 @@ namespace DesktopAnalytics
 		private const long kDefaultMaxSpoolBytes = 50L * 1024 * 1024;
 
 		// Age-based retention floor: an ADDITIONAL, independent eviction dimension alongside the
-		// item/byte caps above (enforced separately by EventSpool.TrimExpired), not a replacement
+		// item/byte caps above (enforced separately by SqliteEventSpool.TrimExpired), not a replacement
 		// for them. Keeps queued (undelivered) events around for roughly two months of offline time
 		// before dropping them -- a generous, explicit retention floor of our own, rather than
 		// whatever much shorter window Mixpanel's legacy /track endpoint implied (moot here anyway,
@@ -121,7 +121,7 @@ namespace DesktopAnalytics
 		// Guards only against overlapping TIMER ticks: if a previous tick's drain is still running
 		// when the next tick fires, the new tick is skipped. It does NOT serialize ticks against
 		// Flush/ShutDown/DrainOnceAsync -- those may run concurrently with a tick, which is safe
-		// because all spool access is serialized inside EventSpool (its semaphore); this flag just
+		// because SqliteEventSpool's own locking makes concurrent callers safe; this flag just
 		// keeps a slow drain from stacking up redundant timer callbacks behind it.
 		private int _timerDraining;
 
@@ -156,8 +156,9 @@ namespace DesktopAnalytics
 					Math.Max(1, flushInterval > 0 ? flushInterval : kDefaultFlushIntervalSeconds));
 
 				_timeProvider = TimeProvider.System;
-				_spool = new EventSpool(EventSpool.GetDefaultSpoolPath(apiSecret), kDefaultMaxSpoolItems,
-					kMaxSpooledEventBytes, kDefaultMaxSpoolBytes);
+				_spool = new SqliteEventSpool(SqliteEventSpool.GetDefaultSpoolPath(apiSecret),
+					kDefaultMaxSpoolItems, kMaxSpooledEventBytes, kDefaultMaxSpoolBytes,
+					timeProvider: _timeProvider);
 				_spool.ItemDroppedByCap += OnItemDroppedByCap;
 				_sender = new MixpanelEventSender(apiSecret);
 				_pipeline = BuildDefaultPipeline(_timeProvider);
@@ -212,7 +213,7 @@ namespace DesktopAnalytics
 
 		// Keeps Statistics.Failed (and therefore Statistics.Submitted == Succeeded + Failed) accurate
 		// for events dropped later by cap enforcement, not just ones dropped at enqueue time -- see
-		// EventSpool.ItemDroppedByCap.
+		// IEventSpool.ItemDroppedByCap.
 		private void OnItemDroppedByCap()
 		{
 			Interlocked.Increment(ref _failed);
@@ -387,7 +388,7 @@ namespace DesktopAnalytics
 					return;
 
 				// Age-based retention floor: cheap to run every tick since it stops at the first
-				// non-expired entry (see EventSpool.TrimExpired's doc comment).
+				// non-expired entry (see SqliteEventSpool.TrimExpired's doc comment).
 				_spool.TrimExpired(TimeSpan.FromDays(kDefaultMaxSpoolAgeDays), _timeProvider.GetUtcNow());
 
 				await _spool.ProcessBatchAsync(_batchSize,
@@ -401,11 +402,12 @@ namespace DesktopAnalytics
 			}
 		}
 
-		// The callback EventSpool.ProcessBatchAsync awaits with the gathered batch; the SendResult
-		// returned is the whole batch's fate (commit vs roll back -- per-record rejections within a
-		// processed batch are counted in the statistics here and still commit). Must never throw or
-		// fault (see EventSpool.ProcessBatchAsync's contract: a thrown exception is treated as a
-		// RetryableFailure anyway, but returning it directly avoids relying on that fallback).
+		// The callback SqliteEventSpool.ProcessBatchAsync awaits with the gathered batch; the
+		// SendResult returned is the whole batch's fate (commit vs roll back -- per-record rejections
+		// within a processed batch are counted in the statistics here and still commit). Must never
+		// throw or fault (see SqliteEventSpool.ProcessBatchAsync's contract: a thrown exception is
+		// treated as a RetryableFailure anyway, but returning it directly avoids relying on that
+		// fallback).
 		private async Task<SendResult> SendBatchGuardedAsync(IReadOnlyList<AnalyticsEvent> batch,
 			CancellationToken cancellationToken, bool usePipeline)
 		{

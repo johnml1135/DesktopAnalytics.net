@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -10,20 +12,20 @@ using Microsoft.Data.Sqlite;
 namespace DesktopAnalytics
 {
 	/// <summary>
-	/// SQLite-backed <see cref="IEventSpool"/>. Same contract as the DiskQueue-backed
-	/// <see cref="EventSpool"/>, but the storage model removes -- rather than works around -- the
-	/// two structural problems that one has.
+	/// SQLite-backed <see cref="IEventSpool"/>. Same contract as the (now removed) DiskQueue-backed
+	/// <c>EventSpool</c>, but the storage model removes -- rather than works around -- the two
+	/// structural problems that one had.
 	/// </summary>
 	/// <remarks>
-	/// <para><b>Why this exists.</b> As written, <see cref="EventSpool"/> holds its global
-	/// <c>_sync</c> semaphore across the network send, so every concurrent <c>Track()</c> waits out
+	/// <para><b>Why this exists.</b> As originally written, <c>EventSpool</c> held its global
+	/// <c>_sync</c> semaphore across the network send, so every concurrent <c>Track()</c> waited out
 	/// the whole send -- measured at ~3s behind a 3s send, and up to ~45s in production against a
-	/// stalled connection (15s HttpClient timeout x 3 pipeline attempts). That is a UI freeze on
+	/// stalled connection (15s HttpClient timeout x 3 pipeline attempts). That was a UI freeze on
 	/// exactly the "bad cafe Wi-Fi" path this whole feature is for.</para>
-	/// <para><b>Note:</b> that stall is NOT inherent to DiskQueue. Probed 2026-07-16: DiskQueue
+	/// <para><b>Note:</b> that stall was not inherent to DiskQueue. Probed 2026-07-16: DiskQueue
 	/// happily enqueues (~8ms) while an uncommitted dequeue session is open, and a second session
 	/// dequeues a DISTINCT item rather than blocking or double-serving. So dropping
-	/// <see cref="EventSpool"/>'s global lock would fix the stall without changing engines. The
+	/// <c>EventSpool</c>'s global lock would have fixed the stall without changing engines. The
 	/// case for SQLite rests on the OTHER problems below, not on the stall alone.</para>
 	/// <para>SQLite needs no such thing. <see cref="ProcessBatchAsync"/> claims a batch under a
 	/// short lock, <b>releases the lock</b>, sends with nothing held, then removes the delivered
@@ -31,16 +33,16 @@ namespace DesktopAnalytics
 	/// and the removal replays the batch, which Mixpanel deduplicates on
 	/// <see cref="AnalyticsEvent.InsertId"/> -- the semantics the design already depends on.
 	/// Because the lock is never held across an await, a plain <c>lock</c> suffices here where
-	/// <see cref="EventSpool"/> needed a <c>SemaphoreSlim</c>.</para>
+	/// <c>EventSpool</c> needed a <c>SemaphoreSlim</c>.</para>
 	/// <para><b>What it deletes.</b> The byte-total sidecar file, its staleness heuristic, and its
 	/// re-measure fallback all collapse into <c>SUM(len)</c>. Age retention collapses into one
 	/// indexed <c>DELETE</c>. Cap eviction collapses into one <c>DELETE</c>. Purge becomes
 	/// <c>DELETE</c> + <c>VACUUM</c> instead of dispose + delete-the-directory + reopen.</para>
 	/// <para><b>Multi-process.</b> WAL gives real concurrent readers/writers, so a second
-	/// FieldWorks process spools and drains normally. Today it cannot even open the DiskQueue
-	/// spool (exclusive lock) and silently degrades to a no-op, losing its events entirely. A
-	/// short lease on claimed rows keeps two processes from uploading the same batch; the lease
-	/// expires on its own, so a process that dies mid-send does not strand its batch.</para>
+	/// FieldWorks process spools and drains normally. The old DiskQueue-backed spool could not even
+	/// open (exclusive lock) and silently degraded to a no-op, losing its events entirely. A short
+	/// lease on claimed rows keeps two processes from uploading the same batch; the lease expires
+	/// on its own, so a process that dies mid-send does not strand its batch.</para>
 	/// </remarks>
 	internal class SqliteEventSpool : IEventSpool
 	{
@@ -76,9 +78,9 @@ namespace DesktopAnalytics
 		/// <param name="maxSpoolBytes">Maximum total serialized size of all retained events;
 		/// enqueuing beyond this drops the oldest first.</param>
 		/// <param name="timeProvider">Clock for lease expiry. Injected so tests stay deterministic.</param>
-		/// <exception cref="Exception">Propagates a failure to create/open the database. Like
-		/// <see cref="EventSpool"/>'s constructor, this is deliberately not swallowed: it is a
-		/// startup-time condition the caller needs to know about.</exception>
+		/// <exception cref="Exception">Propagates a failure to create/open the database. This is
+		/// deliberately not swallowed: it is a startup-time condition the caller needs to know
+		/// about.</exception>
 		public SqliteEventSpool(string spoolDirectory, int maxItems, int maxItemBytes = int.MaxValue,
 			long maxSpoolBytes = long.MaxValue, TimeProvider timeProvider = null)
 		{
@@ -151,12 +153,36 @@ namespace DesktopAnalytics
 			}
 		}
 
+		// Number of leading bytes of the SHA-256 hash of the API key used to build the spool
+		// directory name. Just needs to be stable and distinguish keys from each other -- it is
+		// not a security boundary -- so a short prefix is plenty.
+		private const int kApiKeyHashBytes = 8;
+
 		/// <summary>
-		/// Computes the per-user, per-API-key spool directory, matching
-		/// <see cref="EventSpool.GetDefaultSpoolPath"/> so the two engines key their storage
-		/// identically (DEBUG and RELEASE builds stay separate; the key is never embedded raw).
+		/// Computes the per-user, per-API-key spool directory:
+		/// %LocalAppData%\SIL\DesktopAnalytics\spool\&lt;short hash of apiKey&gt;. The API key is
+		/// hashed (never embedded raw) so that, e.g., DEBUG and RELEASE builds of an app -- which
+		/// use different keys -- get separate spools, without exposing the key via the file system.
 		/// </summary>
-		public static string GetDefaultSpoolPath(string apiKey) => EventSpool.GetDefaultSpoolPath(apiKey);
+		public static string GetDefaultSpoolPath(string apiKey)
+		{
+			var root = Path.Combine(
+				Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+				"SIL", "DesktopAnalytics", "spool");
+			return Path.Combine(root, HashApiKey(apiKey));
+		}
+
+		private static string HashApiKey(string apiKey)
+		{
+			using (var sha = SHA256.Create())
+			{
+				var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(apiKey ?? string.Empty));
+				var builder = new StringBuilder(kApiKeyHashBytes * 2);
+				for (var i = 0; i < kApiKeyHashBytes; i++)
+					builder.Append(hash[i].ToString("x2"));
+				return builder.ToString();
+			}
+		}
 
 		/// <inheritdoc/>
 		public int ApproximateCount
@@ -290,8 +316,8 @@ namespace DesktopAnalytics
 		}
 
 		// Caller must hold _sync. Brings the spool back within BOTH caps, dropping oldest first,
-		// and returns how many events were dropped. Two DELETEs, no loop -- contrast
-		// EventSpool.EnforceCapLocked, which dequeues one item at a time.
+		// and returns how many events were dropped. Two DELETEs, no loop -- contrast the old
+		// DiskQueue-backed EventSpool.EnforceCapLocked, which dequeued one item at a time.
 		private int EnforceCapsLocked()
 		{
 			var dropped = 0;
@@ -546,8 +572,8 @@ namespace DesktopAnalytics
 
 		/// <inheritdoc/>
 		/// <remarks>
-		/// One indexed DELETE. Unlike <see cref="EventSpool.TrimExpired"/> this does not have to
-		/// stop at the first non-expired event -- it removes every expired event wherever it sits,
+		/// One indexed DELETE. Unlike the old DiskQueue-backed EventSpool's TrimExpired, this does
+		/// not have to stop at the first non-expired event -- it removes every expired event wherever it sits,
 		/// so an out-of-order timestamp cannot shield older events from the retention floor. A
 		/// corrupt payload is irrelevant here too: the age lives in a column, so nothing has to be
 		/// deserialized to be dated.
@@ -583,9 +609,9 @@ namespace DesktopAnalytics
 		/// actually gone rather than lingering as free pages; the WAL checkpoint/truncate does the
 		/// same for the write-ahead log. All three matter for a CONSENT purge, where "marked
 		/// consumed" is not good enough.
-		/// <para>Contrast <see cref="EventSpool.Purge"/>, which has to dispose the queue, delete
-		/// the whole directory and reopen -- briefly dropping its cross-process lock, and degrading
-		/// to a no-op spool if another process steals it in that window.</para>
+		/// <para>Contrast the old DiskQueue-backed EventSpool's Purge, which had to dispose the
+		/// queue, delete the whole directory and reopen -- briefly dropping its cross-process lock,
+		/// and degrading to a no-op spool if another process stole it in that window.</para>
 		/// </remarks>
 		public void Purge()
 		{

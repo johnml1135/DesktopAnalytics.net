@@ -12,7 +12,7 @@ using Segment.Serialization;
 
 namespace DesktopAnalyticsTests
 {
-	// Layer 3 of the fidelity ladder in offline-analytics.md: the real EventSpool (on a temp
+	// Layer 3 of the fidelity ladder in offline-analytics.md: the real SqliteEventSpool (on a temp
 	// folder) driving a real MixpanelClient, with a scripted fake IEventSender standing in for the
 	// network. Tests await DrainOnceAsync() directly rather than racing the real background timer (see
 	// "Design-for-test seams" / "Flush-loop scheduling" in offline-analytics.md); InitializeForTest
@@ -150,12 +150,38 @@ namespace DesktopAnalyticsTests
 			}
 		}
 
+		// Reads every file under the spool directory that can be opened for shared reading.
+		// SqliteEventSpool keeps its connection (and thus a share-mode lock on the database file)
+		// open for the whole test, but WAL mode still allows a second, independent handle to read
+		// the file's on-disk bytes concurrently; skipping any file that genuinely cannot be opened
+		// this way does not weaken any event-content assertion.
+		private static IEnumerable<KeyValuePair<string, string>> ReadableSpoolFiles(string spoolDir)
+		{
+			foreach (var file in Directory.GetFiles(spoolDir, "*", SearchOption.AllDirectories))
+			{
+				string content;
+				try
+				{
+					using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+						       FileShare.ReadWrite | FileShare.Delete))
+					using (var reader = new StreamReader(stream, System.Text.Encoding.UTF8))
+						content = reader.ReadToEnd();
+				}
+				catch (IOException)
+				{
+					continue;
+				}
+
+				yield return new KeyValuePair<string, string>(file, content);
+			}
+		}
+
 		// ---- NO-LOSS -------------------------------------------------------------------------
 
 		[Test]
 		public async Task DrainOnce_RetryRetryThenDeliverAcrossSuccessiveCalls_DeliversExactlyOnceAndEmptiesSpool()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new ScriptedSender(new Func<IReadOnlyList<AnalyticsEvent>, BatchSendResult>[]
 				{
@@ -189,7 +215,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_SenderRecordsThenThrows_SameInsertIdSeenAgainOnLaterRetry()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var client = new MixpanelClient();
 
@@ -229,7 +255,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_PoisonDrop_RemovesEventAndIncrementsFailedWithoutRetrying()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new AlwaysResultSender(SendResult.PoisonDrop);
 				var client = new MixpanelClient();
@@ -254,7 +280,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void PurgeQueuedEvents_EmptiesNonEmptySpool()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new AlwaysResultSender(SendResult.Delivered);
 				var client = new MixpanelClient();
@@ -295,7 +321,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task Track_ExceptionEventWithUserPathInStackTrace_ScrubsBeforeSpoolingAndSending()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new AlwaysResultSender(SendResult.Delivered);
 				var client = new MixpanelClient();
@@ -314,7 +340,7 @@ namespace DesktopAnalyticsTests
 				// disk can. Guard against vacuously passing (e.g. if the persisted encoding ever
 				// changes) by requiring the scrubbed marker to actually be FOUND on disk.
 				var scrubbedMarkerFoundOnDisk = false;
-				foreach (var file in EventSpoolTests.ReadableSpoolFiles(_spoolDir))
+				foreach (var file in ReadableSpoolFiles(_spoolDir))
 				{
 					StringAssert.DoesNotContain("alice", file.Value,
 						"unscrubbed user path found on disk in " + file.Key);
@@ -345,7 +371,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task Track_EventNameContainingUserPath_ScrubsEventName()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var client = new MixpanelClient();
 				client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
@@ -369,7 +395,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task Track_UserPathNestedInsideObjectAndArrayProperties_IsScrubbed()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var client = new MixpanelClient();
 				client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
@@ -431,8 +457,8 @@ namespace DesktopAnalyticsTests
 		public void Track_WithNoSpool_NeverThrows()
 		{
 			var client = new MixpanelClient();
-			// Simulates a failed Initialize (e.g. the EventSpool constructor threw acquiring the
-			// cross-process lock), which leaves the client with no spool at all.
+			// Simulates a failed Initialize (e.g. the spool's constructor threw opening its
+			// database), which leaves the client with no spool at all.
 			client.InitializeForTest(null, new AlwaysResultSender(SendResult.Delivered));
 
 			Assert.DoesNotThrow(() => client.Track("user-1", "Save", null));
@@ -458,7 +484,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void DrainOnceAndFlush_SenderAlwaysThrows_NeverPropagateOutOfMixpanelClient()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var client = new MixpanelClient();
 				client.InitializeForTest(spool, new ThrowingSender());
@@ -479,7 +505,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void ShutDown_SenderAlwaysFails_ReturnsPromptlyAndEventsRemainOnDisk()
 		{
-			var spool = new EventSpool(_spoolDir, 10);
+			var spool = new SqliteEventSpool(_spoolDir, 10);
 			var sender = new AlwaysResultSender(SendResult.RetryableFailure);
 			var client = new MixpanelClient();
 			client.InitializeForTest(spool, sender);
@@ -494,9 +520,9 @@ namespace DesktopAnalyticsTests
 			Assert.IsTrue(completed, "ShutDown() did not return within the timeout while offline");
 			Assert.Less(stopwatch.Elapsed, TimeSpan.FromSeconds(15));
 
-			// ShutDown() must have released the spool's cross-process lock -- reopening it and
-			// finding all 5 events proves nothing was lost, and that the lock really was released.
-			using (var reopened = new EventSpool(_spoolDir, 10))
+			// ShutDown() must have disposed the spool's connection -- reopening it and finding all
+			// 5 events proves nothing was lost, and that the connection really was released.
+			using (var reopened = new SqliteEventSpool(_spoolDir, 10))
 			{
 				Assert.AreEqual(5, reopened.ApproximateCount);
 			}
@@ -505,7 +531,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void Flush_WhileOffline_ReturnsPromptlyWithoutEmptyingSpool()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new AlwaysResultSender(SendResult.RetryableFailure);
 				var client = new MixpanelClient();
@@ -534,7 +560,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void ShutDown_SenderBlocksUntilCanceled_ReturnsWithinBoundAndEventRemainsInSpool()
 		{
-			var spool = new EventSpool(_spoolDir, 10);
+			var spool = new SqliteEventSpool(_spoolDir, 10);
 			var sender = new BlockingUntilCanceledSender();
 			var client = new MixpanelClient();
 			client.InitializeForTest(spool, sender);
@@ -550,10 +576,10 @@ namespace DesktopAnalyticsTests
 				"ShutDown() must be bounded even against a server that never responds");
 			Assert.GreaterOrEqual(sender.CallCount, 1);
 
-			// ShutDown() must have released the spool's cross-process lock -- reopening it and
-			// finding the event proves nothing was lost (it was rolled back, not flushed) and that
-			// the lock really was released.
-			using (var reopened = new EventSpool(_spoolDir, 10))
+			// ShutDown() must have disposed the spool's connection -- reopening it and finding the
+			// event proves nothing was lost (it was rolled back, not flushed) and that the
+			// connection really was released.
+			using (var reopened = new SqliteEventSpool(_spoolDir, 10))
 			{
 				Assert.AreEqual(1, reopened.ApproximateCount,
 					"the undelivered event must remain in the spool after a bounded shutdown");
@@ -563,7 +589,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void Flush_SenderBlocksUntilCanceled_ReturnsWithinBoundAndEventRemainsInSpool()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new BlockingUntilCanceledSender();
 				var client = new MixpanelClient();
@@ -592,7 +618,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task ShutDownAsync_SenderBlocksUntilCanceled_ReturnsWithinBoundAndEventRemainsInSpool()
 		{
-			var spool = new EventSpool(_spoolDir, 10);
+			var spool = new SqliteEventSpool(_spoolDir, 10);
 			var sender = new BlockingUntilCanceledSender();
 			var client = new MixpanelClient();
 			client.InitializeForTest(spool, sender);
@@ -607,10 +633,10 @@ namespace DesktopAnalyticsTests
 				"ShutDownAsync() must be bounded even against a server that never responds");
 			Assert.GreaterOrEqual(sender.CallCount, 1);
 
-			// ShutDownAsync() must have released the spool's cross-process lock -- reopening it and
-			// finding the event proves nothing was lost (it was rolled back, not flushed) and that
-			// the lock really was released.
-			using (var reopened = new EventSpool(_spoolDir, 10))
+			// ShutDownAsync() must have disposed the spool's connection -- reopening it and finding
+			// the event proves nothing was lost (it was rolled back, not flushed) and that the
+			// connection really was released.
+			using (var reopened = new SqliteEventSpool(_spoolDir, 10))
 			{
 				Assert.AreEqual(1, reopened.ApproximateCount,
 					"the undelivered event must remain in the spool after a bounded shutdown");
@@ -620,7 +646,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task FlushAsync_SenderBlocksUntilCanceled_ReturnsWithinBoundAndEventRemainsInSpool()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new BlockingUntilCanceledSender();
 				var client = new MixpanelClient();
@@ -645,7 +671,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task FlushAsyncAndShutDownAsync_PreCanceledToken_SkipSendingLeaveEventsAndNeverThrow()
 		{
-			var spool = new EventSpool(_spoolDir, 10);
+			var spool = new SqliteEventSpool(_spoolDir, 10);
 			var sender = new BlockingUntilCanceledSender();
 			var client = new MixpanelClient();
 			client.InitializeForTest(spool, sender);
@@ -665,8 +691,8 @@ namespace DesktopAnalyticsTests
 				Assert.AreEqual(0, sender.CallCount);
 			}
 
-			// The lock must be released and the event still on disk for the next launch.
-			using (var reopened = new EventSpool(_spoolDir, 10))
+			// The connection must be released and the event still on disk for the next launch.
+			using (var reopened = new SqliteEventSpool(_spoolDir, 10))
 			{
 				Assert.AreEqual(1, reopened.ApproximateCount);
 			}
@@ -677,7 +703,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task ShutDownAsync_ThenSyncShutDown_IsIdempotent()
 		{
-			var spool = new EventSpool(_spoolDir, 10);
+			var spool = new SqliteEventSpool(_spoolDir, 10);
 			var client = new MixpanelClient();
 			client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
 
@@ -686,9 +712,9 @@ namespace DesktopAnalyticsTests
 			await client.ShutDownAsync();
 			Assert.DoesNotThrow(() => client.ShutDown());
 
-			// The spool's cross-process lock must be released (and stay released) -- reopening
+			// The spool's connection must be released (and stay released) -- reopening
 			// proves it.
-			using (var reopened = new EventSpool(_spoolDir, 10))
+			using (var reopened = new SqliteEventSpool(_spoolDir, 10))
 			{
 				Assert.AreEqual(0, reopened.ApproximateCount,
 					"the event was delivered during the first shutdown's bounded drain");
@@ -703,7 +729,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task Track_EventOverSizeCap_IsDroppedCountedFailedAndNeverReachesSender()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10, maxItemBytes: 500))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10, maxItemBytes: 500))
 			{
 				var sender = new AlwaysResultSender(SendResult.Delivered);
 				var client = new MixpanelClient();
@@ -733,7 +759,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_EventsExceedingPerTickByteBudget_SpreadsAcrossTicks()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new AlwaysResultSender(SendResult.Delivered);
 				var client = new MixpanelClient();
@@ -764,7 +790,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_BatchProcessedWithSomeRecordsRejected_CountsThemFailedAndRestSucceeded()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new ScriptedSender(new Func<IReadOnlyList<AnalyticsEvent>, BatchSendResult>[]
 				{
@@ -792,7 +818,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void Track_IncrementsSubmittedImmediately()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var client = new MixpanelClient();
 				client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
@@ -810,7 +836,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void Track_EventEvictedByCapEnforcement_IsCountedFailed()
 		{
-			using (var spool = new EventSpool(_spoolDir, 2)) // maxItems = 2
+			using (var spool = new SqliteEventSpool(_spoolDir, 2)) // maxItems = 2
 			{
 				var client = new MixpanelClient();
 				client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
@@ -844,7 +870,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_WithRealRetryPipelineAndZeroDelay_TransientThenSuccess_DeliversWithinOneDrainOnceCall()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new ScriptedSender(new Func<IReadOnlyList<AnalyticsEvent>, BatchSendResult>[]
 				{
@@ -871,7 +897,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_WithRealCircuitBreakerAndZeroDelay_SustainedFailures_TripsBreakerAndStopsCallingSender()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new AlwaysResultSender(SendResult.RetryableFailure);
 				// MinimumThroughput=3 by default (see BuildDefaultPipeline): force enough failing
@@ -908,7 +934,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_WithRealCircuitBreakerAndFixedMinimumThroughput_OpensAfterOneFullyFailingTick()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new AlwaysResultSender(SendResult.RetryableFailure);
 				// Regression test for the bug where MinimumThroughput=4 made the breaker inert: a
@@ -953,7 +979,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task DrainOnce_WithRealCircuitBreaker_AfterBreakDurationElapses_HalfOpenTrialSucceedsAndClosesBreaker()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var shortBreakDuration = TimeSpan.FromMilliseconds(600);
 				var failingSender = new AlwaysResultSender(SendResult.RetryableFailure);
@@ -1026,7 +1052,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void PurgeQueuedEvents_ThenResumeSending_TogglesSendingPaused()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var client = new MixpanelClient();
 				client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
@@ -1049,7 +1075,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public void Track_WhileSendingPaused_DoesNotEnqueue()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var client = new MixpanelClient();
 				client.InitializeForTest(spool, new AlwaysResultSender(SendResult.Delivered));
@@ -1066,14 +1092,13 @@ namespace DesktopAnalyticsTests
 			}
 		}
 
-		// fix: consent revocation must not sit blocked behind an in-flight send (EventSpool.Purge
-		// and ProcessBatchAsync share one lock, held across the network await), and the batch that
+		// fix: consent revocation must not sit blocked behind an in-flight send, and the batch that
 		// send was carrying must not survive to be delivered after consent was revoked -- it must
 		// roll back and then be purged, not slip through.
 		[Test]
 		public async Task PurgeQueuedEvents_WhileSendInFlight_CancelsSendReturnsPromptlyAndPurges()
 		{
-			using (var spool = new EventSpool(_spoolDir, 10))
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
 			{
 				var sender = new BlockingUntilCanceledSender();
 				var client = new MixpanelClient();
@@ -1110,8 +1135,8 @@ namespace DesktopAnalyticsTests
 
 		// ---- CONCURRENCY: Track() racing an in-progress drain ------------------------------------
 
-		// Stress/regression coverage for EventSpool._sync serialization: while a drain's send is
-		// genuinely in flight (blocked, via BlockingUntilSignaledSender, until this test releases
+		// Stress/regression coverage for SqliteEventSpool's concurrency safety: while a drain's send
+		// is genuinely in flight (blocked, via BlockingUntilSignaledSender, until this test releases
 		// it -- never a real Thread.Sleep-style delay), several threads call Track() concurrently.
 		// This does not assert a specific interleaving -- only that nothing throws, nothing
 		// deadlocks, and the bookkeeping (Submitted == Succeeded + Failed + still-spooled) stays
@@ -1119,7 +1144,7 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task ConcurrentTrack_WhileDrainInProgress_NoExceptionsAndConsistentFinalState()
 		{
-			using (var spool = new EventSpool(_spoolDir, 1000))
+			using (var spool = new SqliteEventSpool(_spoolDir, 1000))
 			{
 				var sender = new BlockingUntilSignaledSender();
 				var client = new MixpanelClient();
@@ -1132,8 +1157,8 @@ namespace DesktopAnalyticsTests
 				var drainTask = client.DrainOnceAsync(); // Blocks inside the sender until Release().
 
 				// Wait for the send to actually start, so the concurrent Track() calls below
-				// genuinely race an in-flight drain (EventSpool._sync held across the network await)
-				// rather than running before the drain even begins.
+				// genuinely race an in-flight drain (the send is blocked, awaiting Release()) rather
+				// than running before the drain even begins.
 				var deadline = DateTime.UtcNow.AddSeconds(5);
 				while (sender.CallCount == 0 && DateTime.UtcNow < deadline)
 					await Task.Delay(10);
@@ -1164,10 +1189,10 @@ namespace DesktopAnalyticsTests
 				foreach (var thread in threads)
 					thread.Start();
 
-				// Release the blocked send BEFORE joining, not after: EventSpool._sync is held for
-				// the whole drain (including across this send), so every one of the Track() threads
-				// above piles up waiting on it -- joining first would deadlock forever waiting for
-				// threads that can only make progress once the send (and thus the lock) is released.
+				// Release the blocked send BEFORE joining: DrainOnceAsync (drainTask) only completes
+				// once the sender unblocks, and this test's own cleanup awaits drainTask below, so
+				// releasing first (rather than after joining the Track() threads) avoids ever
+				// leaving the drain permanently blocked.
 				sender.Release();
 
 				foreach (var thread in threads)

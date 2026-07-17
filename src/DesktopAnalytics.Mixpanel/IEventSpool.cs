@@ -6,9 +6,32 @@ using System.Threading.Tasks;
 namespace DesktopAnalytics
 {
 	/// <summary>
+	/// The outcome of attempting to deliver one batch of spooled events, as reported by the caller
+	/// of <see cref="IEventSpool.ProcessBatchAsync"/>. This drives whether the batch is removed
+	/// from the spool (<see cref="Delivered"/>/<see cref="PoisonDrop"/>) or left in place for a
+	/// later retry (<see cref="RetryableFailure"/>). (Per-record rejections within a processed
+	/// batch are the sender/client's concern -- see <see cref="BatchSendResult.FailedIndices"/> --
+	/// and count as <see cref="Delivered"/> here: the batch is finished with either way.)
+	/// </summary>
+	internal enum SendResult
+	{
+		/// <summary>The batch was processed by the server (e.g. HTTP 2xx, or a strict-mode 400
+		/// where the rejected records are individually reported). Remove it from the spool.</summary>
+		Delivered,
+
+		/// <summary>A transient failure (connection error, timeout, 5xx, 429). Leave the batch in
+		/// the spool for a later retry.</summary>
+		RetryableFailure,
+
+		/// <summary>A non-retryable failure (e.g. a 4xx that will never succeed). Remove the batch
+		/// from the spool anyway so bad events cannot wedge the spool forever.</summary>
+		PoisonDrop
+	}
+
+	/// <summary>
 	/// The durable, bounded store of pending <see cref="AnalyticsEvent"/>s behind
-	/// <see cref="MixpanelClient"/>. Implemented by <see cref="EventSpool"/> (DiskQueue) and
-	/// <see cref="SqliteEventSpool"/> (SQLite); see offline-analytics.md for the comparison.
+	/// <see cref="MixpanelClient"/>. Implemented by <see cref="SqliteEventSpool"/>; see
+	/// offline-analytics.md for the design background.
 	/// </summary>
 	/// <remarks>
 	/// Contract shared by every implementation:
