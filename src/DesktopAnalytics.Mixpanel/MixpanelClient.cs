@@ -222,6 +222,21 @@ namespace DesktopAnalytics
 			_batchSize = batchSize;
 		}
 
+		/// <summary>
+		/// Test-only: starts the real background flush <see cref="Timer"/> against whatever
+		/// dependencies <see cref="InitializeForTest"/> already injected. <see cref="InitializeForTest"/>
+		/// deliberately never starts this timer (see its doc comment) because almost every test wants
+		/// to pump <see cref="DrainOnceAsync"/> by hand instead of racing a real timer thread -- call
+		/// this only when a test specifically needs a genuine timer-driven tick (e.g. proving a normal
+		/// drain can be caught mid-send by <see cref="ShutDownAsync"/>, or proving drain-pacing
+		/// acceleration across several real ticks).
+		/// </summary>
+		internal void StartTimerForTest(TimeSpan flushInterval)
+		{
+			_flushInterval = flushInterval;
+			StartTimer();
+		}
+
 		// Keeps Statistics.Failed (and therefore Statistics.Submitted == Succeeded + Failed) accurate
 		// for events dropped later by cap enforcement, not just ones dropped at enqueue time -- see
 		// IEventSpool.ItemDroppedByCap.
@@ -371,7 +386,21 @@ namespace DesktopAnalytics
 
 			try
 			{
+				// Captured before/after the drain (not any new instrumentation) so "this tick made
+				// genuine forward progress" can be detected cheaply: a decrease means at least one
+				// event was actually removed from the spool this tick (delivered, poison-dropped, or
+				// retry-exhausted), as opposed to a tick where nothing happened because we're still
+				// offline (every attempt RetryableFailure/RetryableRejection, count unchanged).
+				var before = _spool?.ApproximateCount ?? 0;
 				await DrainOnceAsync().ConfigureAwait(false);
+				var after = _spool?.ApproximateCount ?? 0;
+
+				// Backlog pacing (Phase 6): if this tick made progress but a backlog remains,
+				// reschedule soon via the same reconnect-accelerator mechanism instead of waiting the
+				// full interval. Skip on no-progress ticks (genuinely offline) to avoid spamming the
+				// network. !_paused guards the same race OnNetworkAddressChanged guards against.
+				if (!_paused && after > 0 && after < before)
+					_flushTimer?.Change(TimeSpan.FromSeconds(kReconnectFlushDelaySeconds), _flushInterval);
 			}
 			catch (Exception e)
 			{
@@ -732,6 +761,10 @@ namespace DesktopAnalytics
 			try
 			{
 				StopTimerPermanently();
+				// StopTimerPermanently only stops FUTURE ticks; a normal drain already mid-send at
+				// this instant would otherwise linger and race the dispose below. Same mechanism
+				// PurgeQueuedEvents uses -- see CancelInFlightSend's own comment.
+				CancelInFlightSend();
 				await BoundedDrainAsync(cancellationToken).ConfigureAwait(false);
 			}
 			catch (Exception e)
