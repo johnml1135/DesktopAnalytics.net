@@ -677,6 +677,46 @@ namespace DesktopAnalytics
 		}
 
 		/// <summary>
+		/// Async counterpart of <see cref="Track(string)"/>, for callers (e.g. FW Lite) that await
+		/// pervasively. See <see cref="IClient.TrackAsync"/> for why this need not (and, for
+		/// <c>MixpanelClient</c>, does not) represent genuinely non-blocking work -- it is API
+		/// ergonomics, not a change to when/how the event is sent.
+		/// </summary>
+		/// <param name="eventName">A good event name should be meaningful to a developer or
+		/// analyst, relatively short, and unique within an app.</param>
+		/// <param name="cancellationToken">Passed through to the underlying client; never faults
+		/// the task.</param>
+		[PublicAPI]
+		public static Task TrackAsync(string eventName, CancellationToken cancellationToken = default)
+		{
+			if (!AllowTracking)
+				return Task.CompletedTask;
+
+			return TrackWithApplicationPropertiesAsync(eventName, null, cancellationToken);
+		}
+
+		/// <summary>
+		/// Async counterpart of <see cref="Track(string, Dictionary{string, string})"/>. See
+		/// <see cref="TrackAsync(string, CancellationToken)"/> for the async-ergonomics rationale.
+		/// </summary>
+		/// <param name="eventName">A good event name should be meaningful to a developer or
+		/// analyst, relatively short, and unique within an app.</param>
+		/// <param name="properties">A dictionary of key-value pairs that are relevant in
+		/// understanding more about the event being tracked.</param>
+		/// <param name="cancellationToken">Passed through to the underlying client; never faults
+		/// the task.</param>
+		[PublicAPI]
+		public static Task TrackAsync(string eventName, Dictionary<string, string> properties,
+			CancellationToken cancellationToken = default)
+		{
+			if (!AllowTracking)
+				return Task.CompletedTask;
+
+			return TrackWithApplicationPropertiesAsync(eventName, MakeSegmentIOProperties(properties),
+				cancellationToken);
+		}
+
+		/// <summary>
 		/// Sends the exception's message and stacktrace
 		/// </summary>
 		/// <param name="e"></param>
@@ -684,6 +724,16 @@ namespace DesktopAnalytics
 		public static void ReportException(Exception e)
 		{
 			ReportException(e, null);
+		}
+
+		/// <summary>
+		/// Async counterpart of <see cref="ReportException(Exception)"/>. See
+		/// <see cref="TrackAsync(string, CancellationToken)"/> for the async-ergonomics rationale.
+		/// </summary>
+		[PublicAPI]
+		public static Task ReportExceptionAsync(Exception e, CancellationToken cancellationToken = default)
+		{
+			return ReportExceptionAsync(e, null, cancellationToken);
 		}
 
 		/// <summary>
@@ -715,6 +765,41 @@ namespace DesktopAnalytics
 					props.Add(key, moreProperties[key]);
 			}
 			TrackWithApplicationProperties("Exception", props);
+		}
+
+		/// <summary>
+		/// Async counterpart of <see cref="ReportException(Exception, Dictionary{string, string})"/>,
+		/// including the same MAX_EXCEPTION_REPORTS_PER_RUN throttling (the counter is shared with
+		/// the sync path). See <see cref="TrackAsync(string, CancellationToken)"/> for the
+		/// async-ergonomics rationale.
+		/// </summary>
+		[PublicAPI]
+		public static Task ReportExceptionAsync(Exception e, Dictionary<string, string> moreProperties,
+			CancellationToken cancellationToken = default)
+		{
+			if (!AllowTracking)
+				return Task.CompletedTask;
+
+			s_exceptionCount++;
+
+			// we had an incident where some problem caused a user to emit hundreds of thousands of exceptions,
+			// in the background, blowing through our Analytics service limits and getting us kicked off.
+			if (s_exceptionCount > kMaxExceptionReportsPerRun)
+			{
+				return Task.CompletedTask;
+			}
+
+			var props = new JsonObject
+			{
+				{ "Message", e.Message },
+				{ "Stack Trace", e.StackTrace }
+			};
+			if (moreProperties != null)
+			{
+				foreach (var key in moreProperties.Keys)
+					props.Add(key, moreProperties[key]);
+			}
+			return TrackWithApplicationPropertiesAsync("Exception", props, cancellationToken);
 		}
 
 		private static JsonObject MakeSegmentIOProperties(Dictionary<string, string> properties)
@@ -1097,6 +1182,36 @@ namespace DesktopAnalytics
 				s_settings.IdForAnalytics,
 				eventName,
 				properties
+			);
+		}
+
+		/// <summary>
+		/// Async counterpart of <see cref="TrackWithApplicationProperties"/>: same defaulting/merge
+		/// logic, routed through <see cref="IClient.TrackAsync"/> instead of <see cref="IClient.Track"/>.
+		/// </summary>
+		private static Task TrackWithApplicationPropertiesAsync(string eventName,
+			JsonObject properties = null, CancellationToken cancellationToken = default)
+		{
+			if (s_singleton == null)
+				throw new ApplicationException("The application must first construct a single Analytics object");
+
+			if (!AllowTracking)
+				return Task.CompletedTask;
+
+			if (properties == null)
+				properties = new JsonObject();
+
+			foreach (var p in s_singleton._propertiesThatGoWithEveryEvent)
+			{
+				properties.Remove(p.Key);
+				properties.Add(p.Key, p.Value ?? Empty);
+			}
+
+			return s_singleton._client.TrackAsync(
+				s_settings.IdForAnalytics,
+				eventName,
+				properties,
+				cancellationToken
 			);
 		}
 

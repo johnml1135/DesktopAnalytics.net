@@ -300,6 +300,9 @@ namespace DesktopAnalytics
 			}
 		}
 
+		/// <inheritdoc/>
+		public Task<bool> EnqueueAsync(AnalyticsEvent evt) => Task.FromResult(Enqueue(evt));
+
 		private void RaiseDropped(int count)
 		{
 			for (var i = 0; i < count; i++)

@@ -75,6 +75,18 @@ namespace DesktopAnalytics
 		}
 
 		/// <summary>
+		/// Completes synchronously: <see cref="Track"/> already just hands the event to
+		/// Segment.Analytics.CSharp's own fire-and-forget delivery pipeline and returns, so there is
+		/// no async work to represent here.
+		/// </summary>
+		public Task TrackAsync(string defaultIdForAnalytics, string eventName, JsonObject properties,
+			CancellationToken cancellationToken = default)
+		{
+			Track(defaultIdForAnalytics, eventName, properties);
+			return Task.CompletedTask;
+		}
+
+		/// <summary>
 		/// Completes synchronously: Segment.Analytics.CSharp's <c>Flush()</c> only signals the
 		/// library's own background delivery (its coroutine system) and exposes nothing awaitable,
 		/// so there is no async work to represent here.

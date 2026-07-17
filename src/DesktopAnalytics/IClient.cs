@@ -20,6 +20,17 @@ namespace DesktopAnalytics
 		void Flush();
 
 		/// <summary>
+		/// Async counterpart of <see cref="Track"/>. Implementations whose <c>Track</c> already
+		/// completes fast (see <c>SegmentClient</c>/<c>MixpanelClient</c>) may complete
+		/// synchronously -- this exists for API ergonomics for callers (e.g. FW Lite) that await
+		/// pervasively, not to change how/when the event is sent. Shares <see cref="Track"/>'s
+		/// contract: must not throw once the client is initialized (implementations that call Track
+		/// before Initialize may still throw, matching Track's own documented behavior).
+		/// </summary>
+		Task TrackAsync(string defaultIdForAnalytics, string eventName, JsonObject properties,
+			CancellationToken cancellationToken = default);
+
+		/// <summary>
 		/// Async counterpart of <see cref="ShutDown"/>. Implementations whose shutdown has nothing
 		/// awaitable (see <see cref="SegmentClient"/>) may complete synchronously; implementations
 		/// with real async delivery work (e.g. <c>MixpanelClient</c>) must never block a

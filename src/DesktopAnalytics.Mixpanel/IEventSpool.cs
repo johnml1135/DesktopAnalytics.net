@@ -75,6 +75,17 @@ namespace DesktopAnalytics
 		bool Enqueue(AnalyticsEvent evt);
 
 		/// <summary>
+		/// Async counterpart of <see cref="Enqueue"/>, added for API completeness as part of the
+		/// async-first work (see offline-analytics-v2-plan.md, Phase 4). Note: <c>MixpanelClient
+		/// .TrackAsync</c> calls the synchronous <see cref="Enqueue"/> path directly and does not go
+		/// through this method -- it is not currently called by anything in this codebase.
+		/// Implementations complete synchronously: a local SQLite insert here is already
+		/// sub-millisecond, and Microsoft.Data.Sqlite does not implement true async I/O anyway, so
+		/// there is no real non-blocking work to represent.
+		/// </summary>
+		Task<bool> EnqueueAsync(AnalyticsEvent evt);
+
+		/// <summary>
 		/// Gathers up to <paramref name="maxItems"/> events (oldest first, bounded by
 		/// <paramref name="maxBytes"/>), hands them to <paramref name="send"/> as ONE batch, and
 		/// commits or rolls back on its verdict: <see cref="SendResult.Delivered"/> and

@@ -118,5 +118,47 @@ namespace DesktopAnalyticsTests
 				Assert.AreEqual(2, client.Statistics.Submitted);
 			}
 		}
+
+		// ---- Same requirement, through the new async entry point (Phase 4) ----------------------
+
+		[Test]
+		public async Task TrackAsync_WhileSendInFlight_ReturnsImmediately_Sqlite()
+		{
+			using (var spool = new SqliteEventSpool(_spoolDir, 1000))
+			{
+				var sender = new BlockingUntilSignaledSender();
+				var client = new MixpanelClient();
+				client.InitializeForTest(spool, sender, batchSize: 5);
+
+				await client.TrackAsync("user-1", "Seed", null);
+
+				var drainTask = client.DrainOnceAsync(); // Blocks inside the sender until Release().
+				await WaitForSendToStart(sender);
+
+				var stopwatch = Stopwatch.StartNew();
+				await client.TrackAsync("user-1", "WhileSendInFlight", null);
+				stopwatch.Stop();
+
+				// TrackAsync wraps the same synchronous Track() (see MixpanelClient.TrackAsync's
+				// doc comment: Task.CompletedTask, no real async work), so it must be just as
+				// responsive as the sync path above -- same 500ms headroom, same rationale.
+				Assert.Less(stopwatch.Elapsed, TimeSpan.FromMilliseconds(500),
+					"TrackAsync() must complete promptly even while a send is genuinely in flight -- " +
+					"it wraps the same non-blocking Track() as the sync entry point");
+
+				sender.Release();
+				await drainTask;
+
+				// Responsiveness must not come from silently dropping the event: it must have been
+				// spooled (and, once the drain completes, delivered).
+				Assert.AreEqual(1, client.Statistics.Succeeded,
+					"the seed event must have been delivered by the drain this test released");
+				await client.DrainOnceAsync();
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"the TrackAsync() call made while the send was in flight must have been spooled, " +
+					"not dropped, and must drain cleanly afterward");
+				Assert.AreEqual(2, client.Statistics.Submitted);
+			}
+		}
 	}
 }

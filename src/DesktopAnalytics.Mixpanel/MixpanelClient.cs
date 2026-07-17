@@ -552,6 +552,20 @@ namespace DesktopAnalytics
 			}
 		}
 
+		/// <summary>
+		/// Completes synchronously: <see cref="Track"/> already returns in single-digit
+		/// milliseconds (a synchronous SQLite insert -- Microsoft.Data.Sqlite does not implement
+		/// true async I/O, so its async ADO.NET methods would not make this any less blocking).
+		/// This exists purely for API ergonomics for callers (e.g. FW Lite) that await pervasively,
+		/// not to make anything genuinely non-blocking that wasn't already fast.
+		/// </summary>
+		public Task TrackAsync(string analyticsId, string eventName, JsonObject properties,
+			CancellationToken cancellationToken = default)
+		{
+			Track(analyticsId, eventName, properties);
+			return Task.CompletedTask;
+		}
+
 		private static JsonObject ScrubProperties(JsonObject properties)
 		{
 			var result = new JsonObject();
