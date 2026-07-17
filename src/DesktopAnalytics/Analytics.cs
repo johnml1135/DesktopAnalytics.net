@@ -742,28 +742,10 @@ namespace DesktopAnalytics
 		/// </summary>
 		public static void ReportException(Exception e, Dictionary<string, string> moreProperties)
 		{
-			if (!AllowTracking)
+			var props = BuildExceptionReportProperties(e, moreProperties);
+			if (props == null)
 				return;
 
-			s_exceptionCount++;
-
-			// we had an incident where some problem caused a user to emit hundreds of thousands of exceptions,
-			// in the background, blowing through our Analytics service limits and getting us kicked off.
-			if (s_exceptionCount > kMaxExceptionReportsPerRun)
-			{
-				return;
-			}
-
-			var props = new JsonObject
-			{
-				{ "Message", e.Message },
-				{ "Stack Trace", e.StackTrace }
-			};
-			if (moreProperties != null)
-			{
-				foreach (var key in moreProperties.Keys)
-					props.Add(key, moreProperties[key]);
-			}
 			TrackWithApplicationProperties("Exception", props);
 		}
 
@@ -777,17 +759,29 @@ namespace DesktopAnalytics
 		public static Task ReportExceptionAsync(Exception e, Dictionary<string, string> moreProperties,
 			CancellationToken cancellationToken = default)
 		{
-			if (!AllowTracking)
+			var props = BuildExceptionReportProperties(e, moreProperties);
+			if (props == null)
 				return Task.CompletedTask;
+
+			return TrackWithApplicationPropertiesAsync("Exception", props, cancellationToken);
+		}
+
+		// Shared throttle/property-building logic behind ReportException and ReportExceptionAsync,
+		// so the two can never silently drift. Returns null if the exception should not be tracked
+		// at all -- either AllowTracking is off, or this run is over kMaxExceptionReportsPerRun (see
+		// the incident note below) -- in which case the caller must not track anything.
+		private static JsonObject BuildExceptionReportProperties(Exception e,
+			Dictionary<string, string> moreProperties)
+		{
+			if (!AllowTracking)
+				return null;
 
 			s_exceptionCount++;
 
 			// we had an incident where some problem caused a user to emit hundreds of thousands of exceptions,
 			// in the background, blowing through our Analytics service limits and getting us kicked off.
 			if (s_exceptionCount > kMaxExceptionReportsPerRun)
-			{
-				return Task.CompletedTask;
-			}
+				return null;
 
 			var props = new JsonObject
 			{
@@ -799,7 +793,7 @@ namespace DesktopAnalytics
 				foreach (var key in moreProperties.Keys)
 					props.Add(key, moreProperties[key]);
 			}
-			return TrackWithApplicationPropertiesAsync("Exception", props, cancellationToken);
+			return props;
 		}
 
 		private static JsonObject MakeSegmentIOProperties(Dictionary<string, string> properties)
@@ -1169,19 +1163,10 @@ namespace DesktopAnalytics
 			if (!AllowTracking)
 				return;
 
-			if (properties == null)
-				properties = new JsonObject();
-
-			foreach (var p in s_singleton._propertiesThatGoWithEveryEvent)
-			{
-				properties.Remove(p.Key);
-				properties.Add(p.Key, p.Value ?? Empty);
-			}
-
 			s_singleton._client.Track(
 				s_settings.IdForAnalytics,
 				eventName,
-				properties
+				MergeApplicationProperties(properties)
 			);
 		}
 
@@ -1198,6 +1183,18 @@ namespace DesktopAnalytics
 			if (!AllowTracking)
 				return Task.CompletedTask;
 
+			return s_singleton._client.TrackAsync(
+				s_settings.IdForAnalytics,
+				eventName,
+				MergeApplicationProperties(properties),
+				cancellationToken
+			);
+		}
+
+		// Shared defaulting/merge logic behind TrackWithApplicationProperties and its async
+		// counterpart, so the two can never silently drift.
+		private static JsonObject MergeApplicationProperties(JsonObject properties)
+		{
 			if (properties == null)
 				properties = new JsonObject();
 
@@ -1207,12 +1204,7 @@ namespace DesktopAnalytics
 				properties.Add(p.Key, p.Value ?? Empty);
 			}
 
-			return s_singleton._client.TrackAsync(
-				s_settings.IdForAnalytics,
-				eventName,
-				properties,
-				cancellationToken
-			);
+			return properties;
 		}
 
 		/// <summary>

@@ -108,22 +108,30 @@ namespace DesktopAnalytics
 		// network-change kicks are ignored until ResumeSending re-enables them.
 		private volatile bool _paused;
 
-		// Cancels whatever timer-driven send (DrainOnceAsync) is currently in flight when consent is
-		// revoked (see PurgeQueuedEvents), so Purge() does not sit blocked behind a network round trip
-		// and the batch that send was carrying rolls back into the spool (which the impending Purge()
-		// then removes) rather than being resent locally after revocation. This is a best-effort
-		// reduction of the window, not a hard guarantee against server-side receipt: if the POST body
-		// was already fully sent to and received by Mixpanel's server before this cancellation is
-		// observed locally, the batch WAS still delivered once -- cancellation only prevents it from
-		// being resent/kept around locally, it cannot recall bytes the server already has. Swapped for
-		// a fresh instance on every purge; never used across a purge boundary. Guarded by
-		// Interlocked.Exchange since PurgeQueuedEvents can run on a different thread (e.g. a UI thread
-		// via Analytics.AllowTracking) than the timer-driven drain it cancels.
+		// Cancels whatever timer-driven send (DrainOnceAsync) is currently in flight, via
+		// CancelInFlightSend -- used by two independent call paths with different post-conditions:
+		// PurgeQueuedEvents (consent revoked; the flush loop keeps running afterward under the fresh
+		// token so the batch that send was carrying rolls back into the spool, which the impending
+		// Purge() then removes, rather than being resent locally after revocation) and ShutDownAsync
+		// (StopTimerPermanently already stopped FUTURE ticks; this only aborts one already in flight
+		// so it cannot linger and race the spool/sender dispose that follows -- the fresh token
+		// swapped in there is simply discarded moments later along with everything else). This is a
+		// best-effort reduction of the window, not a hard guarantee against server-side receipt: if
+		// the POST body was already fully sent to and received by Mixpanel's server before this
+		// cancellation is observed locally, the batch WAS still delivered once -- cancellation only
+		// prevents it from being resent/kept around locally, it cannot recall bytes the server
+		// already has. Guarded by Interlocked.Exchange since both callers (e.g. a UI thread via
+		// Analytics.AllowTracking, or whatever thread calls ShutDown) can run concurrently with the
+		// timer-driven drain being canceled -- and CancelInFlightSend deliberately never Disposes
+		// the swapped-out instance (see its own comment), so a concurrent reader of this field that
+		// raced the swap and is still holding the old CancellationTokenSource can safely finish
+		// using it without needing a lock or risking ObjectDisposedException.
 		private CancellationTokenSource _sendCts = new CancellationTokenSource();
 
 		private int _submitted;
 		private int _succeeded;
 		private int _failed;
+		private int _expired;
 
 		// Guards only against overlapping TIMER ticks: if a previous tick's drain is still running
 		// when the next tick fires, the new tick is skipped. It does NOT serialize ticks against
@@ -166,8 +174,10 @@ namespace DesktopAnalytics
 				_spool = new SqliteEventSpool(SqliteEventSpool.GetDefaultSpoolPath(apiSecret),
 					kDefaultMaxSpoolItems, kMaxSpooledEventBytes, kDefaultMaxSpoolBytes,
 					timeProvider: _timeProvider, maxAttempts: kDefaultMaxRetryAttempts);
-				_spool.ItemDroppedByCap += OnItemDroppedByCap;
-				_spool.ItemDroppedByRetryExhaustion += OnItemDroppedByRetryExhaustion;
+				_spool.ItemDroppedByCap += OnItemPermanentlyDropped;
+				_spool.ItemDroppedByRetryExhaustion += OnItemPermanentlyDropped;
+				_spool.ItemDroppedByCorruption += OnItemPermanentlyDropped;
+				_spool.ItemDroppedByExpiry += OnItemExpired;
 				_sender = new MixpanelEventSender(apiSecret);
 				_pipeline = BuildDefaultPipeline(_timeProvider);
 
@@ -213,8 +223,10 @@ namespace DesktopAnalytics
 			_spool = spool;
 			if (_spool != null)
 			{
-				_spool.ItemDroppedByCap += OnItemDroppedByCap;
-				_spool.ItemDroppedByRetryExhaustion += OnItemDroppedByRetryExhaustion;
+				_spool.ItemDroppedByCap += OnItemPermanentlyDropped;
+				_spool.ItemDroppedByRetryExhaustion += OnItemPermanentlyDropped;
+				_spool.ItemDroppedByCorruption += OnItemPermanentlyDropped;
+				_spool.ItemDroppedByExpiry += OnItemExpired;
 			}
 			_sender = sender;
 			_timeProvider = timeProvider ?? TimeProvider.System;
@@ -237,20 +249,24 @@ namespace DesktopAnalytics
 			StartTimer();
 		}
 
-		// Keeps Statistics.Failed (and therefore Statistics.Submitted == Succeeded + Failed) accurate
-		// for events dropped later by cap enforcement, not just ones dropped at enqueue time -- see
-		// IEventSpool.ItemDroppedByCap.
-		private void OnItemDroppedByCap()
+		// Shared by all three of the spool's "permanently dropped, never delivered" events --
+		// ItemDroppedByCap (capacity eviction), ItemDroppedByRetryExhaustion (decision D6), and
+		// ItemDroppedByCorruption (an undeserializable row) -- since each has exactly the same
+		// statistics effect: keeping Statistics.Failed accurate for a drop that happens later than,
+		// and separately from, Track()'s own enqueue-time accounting. ItemDroppedByExpiry is
+		// deliberately NOT included here -- see OnItemExpired.
+		private void OnItemPermanentlyDropped()
 		{
 			Interlocked.Increment(ref _failed);
 		}
 
-		// Same statistics effect as cap eviction (see OnItemDroppedByCap above): an event dropped
-		// for exceeding the retry ceiling will also never be delivered. See
-		// IEventSpool.ItemDroppedByRetryExhaustion.
-		private void OnItemDroppedByRetryExhaustion()
+		// ItemDroppedByExpiry gets its own counter rather than folding into OnItemPermanentlyDropped:
+		// an event aged out by the retention floor was never attempted and rejected, so counting it
+		// as Failed would conflate "we tried and it didn't work" with "we never got to it in time".
+		// Keeps Statistics.Submitted == Succeeded + Failed + Expired accurate for this drop path.
+		private void OnItemExpired()
 		{
-			Interlocked.Increment(ref _failed);
+			Interlocked.Increment(ref _expired);
 		}
 
 		/// <summary>
@@ -273,8 +289,16 @@ namespace DesktopAnalytics
 			TimeSpan? retryDelay = null,
 			TimeSpan? breakDuration = null)
 		{
+			// Both retryable verdicts must be handled here, not just RetryableFailure: a
+			// RetryableRejection (HTTP 408/429/5xx -- the batch DID reach the server) is exactly the
+			// "server is struggling, back off" case the circuit breaker exists for. Omitting it would
+			// make a sustained 429/5xx outage invisible to both in-tick retry and the breaker's
+			// failure tracking, so the client would keep hammering an already-struggling endpoint
+			// every flush tick.
 			bool ShouldHandleOutcome(Outcome<BatchSendResult> outcome) =>
-				outcome.Exception != null || outcome.Result?.Outcome == SendResult.RetryableFailure;
+				outcome.Exception != null ||
+				outcome.Result?.Outcome == SendResult.RetryableFailure ||
+				outcome.Result?.Outcome == SendResult.RetryableRejection;
 
 			var retryOptions = new RetryStrategyOptions<BatchSendResult>
 			{
@@ -289,14 +313,22 @@ namespace DesktopAnalytics
 			{
 				ShouldHandle = args => new ValueTask<bool>(ShouldHandleOutcome(args.Outcome)),
 				FailureRatio = 0.5,
-				// Matches attempts-per-tick: a fully failing drain tick produces exactly 3
-				// outcomes through this pipeline (1 initial attempt + MaxRetryAttempts=2 retries),
-				// all within the same instant, so all 3 always land in one SamplingDuration window.
-				// With this at 4 (the previous value), a single tick could never reach the minimum
-				// throughput -- and successive ticks are kDefaultFlushIntervalSeconds (30s) apart,
-				// far outside the 10s window -- so the breaker could never open at all during a
-				// sustained outage. 3 makes one bad tick enough to trip it.
-				MinimumThroughput = 3,
+				// Matches attempts-per-tick: a fully failing drain tick produces exactly
+				// maxRetryAttempts + 1 outcomes through this pipeline (1 initial attempt + the
+				// configured retries), all within the same instant, so they all land in one
+				// SamplingDuration window. Derived from maxRetryAttempts -- rather than a separate
+				// hardcoded literal -- so the two can never silently drift out of sync: with a value
+				// too high for the actual attempts-per-tick, a single tick could never reach the
+				// minimum throughput, and successive ticks are kDefaultFlushIntervalSeconds (30s)
+				// apart, far outside the 10s window below, so the breaker could never open at all
+				// during a sustained outage. Clamped to Polly's own minimum (2), which only avoids a
+				// build-time rejection for maxRetryAttempts: 0 -- it does NOT restore the "one bad
+				// tick trips the breaker" property for that value specifically, since a 0-retry tick
+				// still produces only 1 outcome and reaching 2 then requires a second tick 30s later,
+				// outside this window. Production always passes >= 1 (the default is 2), where the
+				// property holds; 0 remains usable but degrades to the slower multi-tick behavior the
+				// original (pre-fix) hardcoded-literal bug had for every value.
+				MinimumThroughput = Math.Max(2, maxRetryAttempts + 1),
 				SamplingDuration = TimeSpan.FromSeconds(10),
 				BreakDuration = breakDuration ?? TimeSpan.FromSeconds(5)
 			};
@@ -426,8 +458,9 @@ namespace DesktopAnalytics
 		}
 
 		// Shared implementation behind DrainOnceAsync() and BoundedDrainAsync(). usePipeline is false
-		// only for BoundedDrainAsync's bounded attempts (see its comment for why retries are skipped
-		// there).
+		// only for BoundedDrainAsync's bounded attempts (see its comment for why retries are skipped,
+		// and why a RetryableRejection there is remapped in SendBatchGuardedAsync so it does not
+		// erode the per-event retry ceiling either).
 		private async Task DrainOnceCoreAsync(CancellationToken cancellationToken, bool usePipeline)
 		{
 			try
@@ -488,7 +521,20 @@ namespace DesktopAnalytics
 					return SendResult.RetryableFailure;
 				}
 
-				switch (result.Outcome)
+				// See BoundedDrainAsync's remarks for why usePipeline also gates this: its compressed,
+				// many-attempts-in-seconds retry loop must not let a RetryableRejection erode the
+				// per-event retry ceiling the way it does on a normal, once-per-30s-tick drain.
+				// Remapping to RetryableFailure reuses that verdict's existing "never counted"
+				// handling in SqliteEventSpool.ResolveClaim rather than threading a second flag
+				// through IEventSpool's contract for what both verdicts already treat identically
+				// otherwise (leave the batch spooled, in order, for a later retry). Normalized BEFORE
+				// the switch below (rather than on the way out) so both statistics accounting and the
+				// returned verdict always agree on the one true outcome for this call.
+				var outcome = !usePipeline && result.Outcome == SendResult.RetryableRejection
+					? SendResult.RetryableFailure
+					: result.Outcome;
+
+				switch (outcome)
 				{
 					case SendResult.Delivered:
 						var failed = result.FailedIndices.Count;
@@ -501,7 +547,7 @@ namespace DesktopAnalytics
 						break;
 				}
 
-				return result.Outcome;
+				return outcome;
 			}
 			catch (Exception e)
 			{
@@ -673,6 +719,19 @@ namespace DesktopAnalytics
 		/// shutdown/flush has little delivery value (we are about to give up on this attempt
 		/// anyway) and would multiply -- rather than bound -- the time spent waiting on a hanging
 		/// server.</item>
+		/// <item>The per-event retry-attempt ceiling is bypassed too: unlike a normal timer tick
+		/// (kDefaultFlushIntervalSeconds = 30s apart, so reaching kDefaultMaxRetryAttempts takes
+		/// roughly 5 minutes of real rejections), this loop can drive up to kBoundedDrainMaxAttempts
+		/// attempts back-to-back within s_boundedDrainDuration. If the server were quickly returning
+		/// RetryableRejection (e.g. rate-limiting), counting those against the ceiling here could
+		/// burn through it in seconds and permanently drop otherwise-good events -- during a single
+		/// Flush()/ShutDown() call -- for reasons that have nothing to do with the event itself.
+		/// <see cref="SendBatchGuardedAsync"/> remaps a RetryableRejection to RetryableFailure
+		/// whenever <c>usePipeline</c> is false (i.e. only on this bounded path), reusing
+		/// RetryableFailure's existing "never counted" semantics rather than threading a second flag
+		/// all the way through <see cref="IEventSpool.ProcessBatchAsync"/>'s contract. The ceiling
+		/// still applies normally to every ordinary timer-driven tick; this only exempts the
+		/// compressed, bounded-drain-specific retry loop from also counting against it.</item>
 		/// </list>
 		/// </remarks>
 		private async Task BoundedDrainAsync(CancellationToken cancellationToken)
@@ -835,24 +894,26 @@ namespace DesktopAnalytics
 			}
 		}
 
-		// Aborts whatever timer-driven send is currently in flight (if any) so Purge() does not block
-		// behind a network round trip and the in-flight batch rolls back into the spool -- where the
-		// impending Purge() removes it -- rather than being resent/kept around locally after consent
-		// was just revoked. This best-effort cancellation reduces, but cannot eliminate, the window:
-		// it cannot recall a POST body Mixpanel's server already fully received before the local await
-		// observed cancellation. Swaps in a fresh, non-canceled token so the NEXT drain (post-purge, or
-		// after ResumeSending) is unaffected.
+		// Aborts whatever timer-driven send is currently in flight (if any). Two call sites, two
+		// different reasons: PurgeQueuedEvents uses this so Purge() does not block behind a network
+		// round trip, and so the in-flight batch rolls back into the spool -- where the impending
+		// Purge() removes it -- rather than being resent/kept around locally after consent was just
+		// revoked (best-effort: cannot recall a POST body Mixpanel's server already fully received
+		// before the local await observed cancellation). ShutDownAsync uses the exact same swap here
+		// for a different reason -- see _sendCts's field doc -- to stop a lingering send from racing
+		// the spool/sender dispose that follows shutdown; nothing there depends on the fresh token
+		// this swaps in, since everything is torn down moments later regardless. Swaps in a fresh,
+		// non-canceled token either way (for PurgeQueuedEvents, that token goes on to back the NEXT
+		// drain -- post-purge, or after ResumeSending). Deliberately does NOT Dispose the swapped-out
+		// instance: _sendCts has no timer and nothing external registers against its Token beyond
+		// this one drain's own await chain, which Cancel() (above) already unwinds -- so there is
+		// nothing meaningful to release early, and skipping Dispose means a concurrent DrainOnceAsync
+		// that already captured the old token (see DrainOnceAsync) can safely keep using it instead
+		// of racing an ObjectDisposedException against this swap.
 		private void CancelInFlightSend()
 		{
 			var previous = Interlocked.Exchange(ref _sendCts, new CancellationTokenSource());
-			try
-			{
-				previous.Cancel();
-			}
-			finally
-			{
-				previous.Dispose();
-			}
+			previous.Cancel();
 		}
 
 		/// <summary>
@@ -906,7 +967,7 @@ namespace DesktopAnalytics
 			}
 		}
 
-		public Statistics Statistics => new Statistics(_submitted, _succeeded, _failed);
+		public Statistics Statistics => new Statistics(_submitted, _succeeded, _failed, _expired);
 
 		// Test seam: exposes whether the flush loop is currently paused (consent revoked). See
 		// MixpanelClientTests. Not part of IClient.

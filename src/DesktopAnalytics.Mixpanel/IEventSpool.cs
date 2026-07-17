@@ -85,6 +85,27 @@ namespace DesktopAnalytics
 		/// </summary>
 		event Action ItemDroppedByRetryExhaustion;
 
+		/// <summary>
+		/// Raised once per claimed event whose stored payload could not be deserialized (on-disk
+		/// corruption, or a payload written by a since-upgraded, incompatible schema version) and
+		/// was therefore removed -- it can never be delivered. Distinct from both
+		/// <see cref="ItemDroppedByCap"/> and <see cref="ItemDroppedByRetryExhaustion"/>, neither of
+		/// which fires for this case, and without which such a drop would silently go uncounted.
+		/// Handlers must be fast and must not call back into the spool.
+		/// </summary>
+		event Action ItemDroppedByCorruption;
+
+		/// <summary>
+		/// Raised once per event permanently dropped by <see cref="TrimExpired"/>'s age-based
+		/// retention floor -- distinct from <see cref="ItemDroppedByCap"/> (capacity-based eviction)
+		/// and <see cref="ItemDroppedByCorruption"/> (an undeserializable row): those are counted as
+		/// <c>Statistics.Failed</c>, while this is counted separately as <c>Statistics.Expired</c>,
+		/// since aging out is a retention decision rather than a delivery failure. Without this
+		/// event, an event dropped this way would silently go uncounted anywhere in
+		/// <c>Statistics</c>. Handlers must be fast and must not call back into the spool.
+		/// </summary>
+		event Action ItemDroppedByExpiry;
+
 		/// <summary>An approximate count of events currently spooled. Accurate enough for
 		/// bounding and diagnostics; not a hard guarantee under concurrent access.</summary>
 		int ApproximateCount { get; }
@@ -137,7 +158,10 @@ namespace DesktopAnalytics
 
 		/// <summary>
 		/// Empties the spool entirely (consent revocation), removing the event data from disk --
-		/// not merely marking it consumed.
+		/// not merely marking it consumed -- before returning. May be called from a UI thread (e.g.
+		/// from <c>Analytics.AllowTracking</c>'s setter); implementations should keep this bounded to
+		/// a small, measured cost rather than an unbounded one (see <c>SqliteEventSpool.Purge</c>'s
+		/// doc comment for why a backgrounded version of this was tried and reverted).
 		/// </summary>
 		void Purge();
 	}

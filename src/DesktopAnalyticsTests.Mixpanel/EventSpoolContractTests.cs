@@ -303,9 +303,15 @@ namespace DesktopAnalyticsTests
 		[Test]
 		public async Task Enqueue_ExceedingMaxSpoolBytes_DropsOldestKeepsNewest()
 		{
+			// A shared, fixed timestamp keeps every event's serialized length identical: Time's
+			// fractional-seconds component can otherwise vary by a byte or two between events
+			// created microseconds apart, which would make the cap computed below land a few bytes
+			// off from the four events' real total and flip which one the byte cap evicts.
+			var now = DateTimeOffset.UtcNow;
 			var events = new[]
 			{
-				MakeEvent("Event-A"), MakeEvent("Event-B"), MakeEvent("Event-C"), MakeEvent("Event-D")
+				MakeEventAt("Event-A", now), MakeEventAt("Event-B", now),
+				MakeEventAt("Event-C", now), MakeEventAt("Event-D", now)
 			};
 			long cap = events[0].ToBytes().Length + events[1].ToBytes().Length +
 				events[2].ToBytes().Length;
@@ -368,6 +374,27 @@ namespace DesktopAnalyticsTests
 				spool.TrimExpired(TimeSpan.FromDays(60), now);
 
 				Assert.AreEqual(0, spool.ApproximateCount);
+			}
+		}
+
+		[Test]
+		public void TrimExpired_EventOlderThanMaxAge_RaisesItemDroppedByExpiry()
+		{
+			using (var spool = Create(10))
+			{
+				var now = DateTimeOffset.UtcNow;
+				spool.Enqueue(MakeEventAt("Old1", now - TimeSpan.FromDays(90)));
+				spool.Enqueue(MakeEventAt("Old2", now - TimeSpan.FromDays(90)));
+				spool.Enqueue(MakeEventAt("Fresh", now - TimeSpan.FromDays(10)));
+
+				var expiredCount = 0;
+				spool.ItemDroppedByExpiry += () => Interlocked.Increment(ref expiredCount);
+
+				spool.TrimExpired(TimeSpan.FromDays(60), now);
+
+				Assert.AreEqual(1, spool.ApproximateCount, "only the fresh event should remain");
+				Assert.AreEqual(2, expiredCount,
+					"ItemDroppedByExpiry must fire once per expired event actually removed");
 			}
 		}
 
@@ -488,6 +515,108 @@ namespace DesktopAnalyticsTests
 			{
 				Assert.DoesNotThrow(() => spool.Purge());
 				Assert.AreEqual(0, spool.ApproximateCount);
+			}
+		}
+
+		[Test]
+		public void Purge_ThenImmediateDispose_PurgedDataStillNotOnDisk()
+		{
+			// Purge() runs its DELETE/VACUUM/checkpoint synchronously (see Purge's doc comment for
+			// why an earlier backgrounded version of this was tried and reverted), so by the time it
+			// returns the disk-scrub is already complete -- an immediately-following Dispose() (no
+			// delay at all, as below) has nothing left to race or skip. This pins that guarantee
+			// down as an explicit regression test rather than leaving it as something only true "by
+			// construction" of Purge() being synchronous.
+			var dir = Path.Combine(Path.GetTempPath(), "SpoolContract_ImmediateDispose_" + Guid.NewGuid());
+			try
+			{
+				using (var spool = _factory.Create(dir, 10, int.MaxValue, long.MaxValue))
+				{
+					spool.Enqueue(MakeEvent("SecretEventName"));
+					spool.Purge();
+				}
+
+				foreach (var file in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
+				{
+					string content;
+					try
+					{
+						using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+							       FileShare.ReadWrite | FileShare.Delete))
+						using (var reader = new StreamReader(stream, System.Text.Encoding.UTF8))
+							content = reader.ReadToEnd();
+					}
+					catch (IOException)
+					{
+						continue;
+					}
+
+					StringAssert.DoesNotContain("SecretEventName", content,
+						"purged event data must not survive anywhere on disk in " + file +
+						" even when Dispose() immediately follows Purge()");
+				}
+			}
+			finally
+			{
+				try { Directory.Delete(dir, true); } catch { }
+			}
+		}
+
+		// ---- CORRUPT / UNDESERIALIZABLE PAYLOADS -------------------------------------------------
+		//
+		// Regression coverage for two related fixes: (1) ProcessBatchAsync's exception-path call to
+		// ResolveClaim used to omit undeserializableIds, so a corrupt row claimed alongside events
+		// whose send() call threw would never be removed -- it would loop forever, re-claimed and
+		// re-failing to deserialize on every subsequent drain. (2) IEventSpool.ItemDroppedByCorruption
+		// (consumed by MixpanelClient to keep Statistics.Failed accurate) did not exist at all, so an
+		// undeserializable row vanished from the spool with no way for a caller to ever count it.
+
+		[Test]
+		public async Task ProcessBatch_AllRowsCorrupt_RemovedWithoutCallingSendAndRaisesItemDroppedByCorruption()
+		{
+			using (var spool = Create(10))
+			{
+				spool.Enqueue(MakeEvent("A"));
+				SpoolCorruptionTestHelper.CorruptAllPayloads(_spoolDir);
+
+				var corruptedCount = 0;
+				spool.ItemDroppedByCorruption += () => Interlocked.Increment(ref corruptedCount);
+
+				var sendCalled = false;
+				await spool.ProcessBatchAsync(100, (batch, ct) =>
+				{
+					sendCalled = true;
+					return Task.FromResult(SendResult.Delivered);
+				});
+
+				Assert.IsFalse(sendCalled,
+					"a batch that is entirely undeserializable must never reach send()");
+				Assert.AreEqual(0, spool.ApproximateCount, "the corrupt row must be removed");
+				Assert.AreEqual(1, corruptedCount,
+					"ItemDroppedByCorruption must fire once for the corrupt row");
+			}
+		}
+
+		[Test]
+		public async Task ProcessBatch_MixedBatchAndSendThrows_CorruptRowStillRemovedAndValidRowReleased()
+		{
+			using (var spool = Create(10))
+			{
+				spool.Enqueue(MakeEvent("Good"));
+				SpoolCorruptionTestHelper.CorruptOldestPayload(_spoolDir);
+				spool.Enqueue(MakeEvent("AlsoGood"));
+
+				var corruptedCount = 0;
+				spool.ItemDroppedByCorruption += () => Interlocked.Increment(ref corruptedCount);
+
+				await spool.ProcessBatchAsync(100,
+					(batch, ct) => throw new InvalidOperationException("simulated send failure"));
+
+				Assert.AreEqual(1, corruptedCount,
+					"the corrupt row must still be removed even though send() threw for the batch");
+				Assert.AreEqual(1, spool.ApproximateCount,
+					"the corrupt row is gone; the still-valid row remains, released for a later retry");
+				CollectionAssert.AreEqual(new[] { "AlsoGood" }, await DrainAllDelivered(spool));
 			}
 		}
 

@@ -73,6 +73,12 @@ namespace DesktopAnalytics
 		/// <inheritdoc/>
 		public event Action ItemDroppedByRetryExhaustion;
 
+		/// <inheritdoc/>
+		public event Action ItemDroppedByCorruption;
+
+		/// <inheritdoc/>
+		public event Action ItemDroppedByExpiry;
+
 		/// <param name="spoolDirectory">Directory to hold the spool database. Callers normally get
 		/// this from <see cref="GetDefaultSpoolPath"/>; tests inject a temp directory.</param>
 		/// <param name="maxItems">Maximum number of events retained; enqueuing beyond this drops
@@ -82,7 +88,7 @@ namespace DesktopAnalytics
 		/// <param name="maxSpoolBytes">Maximum total serialized size of all retained events;
 		/// enqueuing beyond this drops the oldest first.</param>
 		/// <param name="timeProvider">Clock for lease expiry. Injected so tests stay deterministic.</param>
-		/// <param name="maxAttempts">Maximum number of <see cref="SendResult.RetryableFailure"/>
+		/// <param name="maxAttempts">Maximum number of <see cref="SendResult.RetryableRejection"/>
 		/// verdicts a single event may accumulate before it is permanently dropped (see
 		/// offline-analytics-v2-plan.md, Phase 5 / decision D6) and
 		/// <see cref="ItemDroppedByRetryExhaustion"/> is raised for it. Bounds the case where a
@@ -318,79 +324,73 @@ namespace DesktopAnalytics
 		/// <inheritdoc/>
 		public Task<bool> EnqueueAsync(AnalyticsEvent evt) => Task.FromResult(Enqueue(evt));
 
-		private void RaiseDropped(int count)
-		{
-			for (var i = 0; i < count; i++)
-			{
-				try
-				{
-					ItemDroppedByCap?.Invoke();
-				}
-				catch (Exception e)
-				{
-					Debug.WriteLine("SqliteEventSpool: ItemDroppedByCap handler threw: " + e);
-				}
-			}
-		}
+		private void RaiseDropped(int count) => RaiseDropEvent(ItemDroppedByCap, count, nameof(ItemDroppedByCap));
 
-		private void RaiseRetryExhausted(int count)
+		private void RaiseRetryExhausted(int count) =>
+			RaiseDropEvent(ItemDroppedByRetryExhaustion, count, nameof(ItemDroppedByRetryExhaustion));
+
+		private void RaiseCorrupted(int count) =>
+			RaiseDropEvent(ItemDroppedByCorruption, count, nameof(ItemDroppedByCorruption));
+
+		private void RaiseExpired(int count) =>
+			RaiseDropEvent(ItemDroppedByExpiry, count, nameof(ItemDroppedByExpiry));
+
+		// Shared by all four "permanently dropped" events above: from inside the declaring class,
+		// an event field reads like a plain delegate field, so one handler-agnostic helper can raise
+		// any of them count times, each invocation independently guarded so one misbehaving
+		// subscriber can't stop the rest from being counted.
+		private static void RaiseDropEvent(Action handler, int count, string eventName)
 		{
 			for (var i = 0; i < count; i++)
 			{
 				try
 				{
-					ItemDroppedByRetryExhaustion?.Invoke();
+					handler?.Invoke();
 				}
 				catch (Exception e)
 				{
-					Debug.WriteLine("SqliteEventSpool: ItemDroppedByRetryExhaustion handler threw: " + e);
+					Debug.WriteLine("SqliteEventSpool: " + eventName + " handler threw: " + e);
 				}
 			}
 		}
 
 		// Caller must hold _sync. Brings the spool back within BOTH caps, dropping oldest first,
-		// and returns how many events were dropped. Two DELETEs, no loop -- contrast the old
+		// and returns how many events were dropped. One DELETE, no loop -- contrast the old
 		// DiskQueue-backed EventSpool.EnforceCapLocked, which dequeued one item at a time.
 		private int EnforceCapsLocked()
 		{
-			var dropped = 0;
 			try
 			{
-				// Item cap. Also covers the degenerate maxItems == 0 case, where the event just
-				// enqueued is itself evicted.
 				using (var cmd = _connection.CreateCommand())
 				{
-					cmd.CommandText =
-						"DELETE FROM events WHERE id IN (" +
-						"  SELECT id FROM events ORDER BY id ASC" +
-						"  LIMIT MAX(0, (SELECT COUNT(*) FROM events) - @maxItems));";
+					// Both caps evaluated in a single pass over the table (one window-function scan
+					// instead of a separate COUNT(*) for the item cap plus a separate SUM(len) scan
+					// for the byte cap -- this runs on every Enqueue, so halving the per-call scan
+					// cost matters). rn > @maxItems: this row is not among the newest maxItems rows
+					// (also covers the degenerate maxItems == 0 case, where the event just enqueued
+					// is itself evicted). running > @maxBytes: including this row (and everything
+					// newer) would push the running total, counted newest-first, past the byte cap.
+					cmd.CommandText = _maxSpoolBytes < long.MaxValue
+						? "DELETE FROM events WHERE id IN (" +
+						  "  SELECT id FROM (" +
+						  "    SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS rn," +
+						  "           SUM(len) OVER (ORDER BY id DESC) AS running FROM events" +
+						  "  ) WHERE rn > @maxItems OR running > @maxBytes);"
+						: "DELETE FROM events WHERE id IN (" +
+						  "  SELECT id FROM (" +
+						  "    SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS rn FROM events" +
+						  "  ) WHERE rn > @maxItems);";
 					cmd.Parameters.AddWithValue("@maxItems", _maxItems);
-					dropped += cmd.ExecuteNonQuery();
-				}
-
-				// Byte cap. The window function totals bytes newest-first; any row whose inclusion
-				// pushes that running total past the cap is older than what we can afford to keep,
-				// so it goes.
-				if (_maxSpoolBytes < long.MaxValue)
-				{
-					using (var cmd = _connection.CreateCommand())
-					{
-						cmd.CommandText =
-							"DELETE FROM events WHERE id IN (" +
-							"  SELECT id FROM (" +
-							"    SELECT id, SUM(len) OVER (ORDER BY id DESC) AS running FROM events" +
-							"  ) WHERE running > @maxBytes);";
+					if (_maxSpoolBytes < long.MaxValue)
 						cmd.Parameters.AddWithValue("@maxBytes", _maxSpoolBytes);
-						dropped += cmd.ExecuteNonQuery();
-					}
+					return cmd.ExecuteNonQuery();
 				}
 			}
 			catch (Exception e)
 			{
 				Debug.WriteLine("SqliteEventSpool.EnforceCaps failed: " + e);
+				return 0;
 			}
-
-			return dropped;
 		}
 
 		/// <inheritdoc/>
@@ -416,7 +416,13 @@ namespace DesktopAnalytics
 				{
 					// Everything claimed was undeserializable (corrupt, or an incompatible schema
 					// version). Nothing to send; just remove them so they cannot wedge the spool.
-					ResolveClaim(claim.Ids, ClaimOutcome.Remove);
+					// RaiseCorrupted uses ResolveClaim's own return value (how many undeserializable
+					// rows THIS call actually deleted), not claim.UndeserializableIds.Count, so a row
+					// a concurrent Purge() already removed (Purge's DELETE races ClaimBatch/ResolveClaim
+					// the same way a send does -- see the class remarks) or a failed transaction
+					// (ResolveClaim returns 0 on any exception) is never double- or over-counted.
+					RaiseCorrupted(ResolveClaim(claim.Ids, ClaimOutcome.Remove,
+						undeserializableIds: claim.UndeserializableIds));
 					return;
 				}
 
@@ -430,13 +436,18 @@ namespace DesktopAnalytics
 				{
 					// A throwing send is a connectivity-style failure (we don't know anything about
 					// this batch's deliverability), exactly like SendResult.RetryableFailure -- see
-					// ResolveOutcome. Must NOT count against the retry-attempt ceiling.
+					// ResolveOutcome. Must NOT count against the retry-attempt ceiling. Undeserializable
+					// rows in the same claim are still removed regardless (see ResolveClaim) -- passed
+					// through here the same as the non-throwing path below, so a corrupt row cannot
+					// loop forever just because the batch alongside it happened to throw.
 					Debug.WriteLine("SqliteEventSpool.ProcessBatch: send threw, leaving batch for retry: " + e);
-					ResolveClaim(claim.Ids, ClaimOutcome.ReleaseOnly);
+					RaiseCorrupted(ResolveClaim(claim.Ids, ClaimOutcome.ReleaseOnly,
+						undeserializableIds: claim.UndeserializableIds));
 					return;
 				}
 
-				ResolveClaim(claim.Ids, ResolveOutcome(result), undeserializableIds: claim.UndeserializableIds);
+				RaiseCorrupted(ResolveClaim(claim.Ids, ResolveOutcome(result),
+					undeserializableIds: claim.UndeserializableIds));
 			}
 			catch (Exception e)
 			{
@@ -467,6 +478,12 @@ namespace DesktopAnalytics
 			CountAttemptAndRelease
 		}
 
+		// MixpanelClient.SendBatchGuardedAsync remaps RetryableRejection to RetryableFailure before it
+		// ever reaches here when running BoundedDrainAsync's compressed, many-attempts-in-seconds
+		// drain loop (see its doc comment) -- so a rejection there still leaves the batch spooled for
+		// retry, exactly like a normal tick, but never reaches the CountAttemptAndRelease case below
+		// and so does not additionally erode the attempt ceiling. This method only ever sees the
+		// post-remap result and needs no awareness of which caller produced it.
 		private static ClaimOutcome ResolveOutcome(SendResult result)
 		{
 			switch (result)
@@ -574,41 +591,55 @@ namespace DesktopAnalytics
 		// DELETE. Otherwise: clear the lease so the next drain retries the batch, in order -- and,
 		// ONLY for CountAttemptAndRelease, also bump the attempt counter and drop any event whose
 		// count just reached the configured max (dropped NOW, not on some future failure, since
-		// the check runs after the increment).
-		private void ResolveClaim(List<long> ids, ClaimOutcome outcome, List<long> undeserializableIds = null)
+		// the check runs after the increment). Returns how many of undeserializableIds THIS call
+		// actually deleted (0 on any exception, including a partial failure that rolled the whole
+		// transaction back) -- deliberately not just undeserializableIds.Count, since a concurrent
+		// Purge() can remove the same row first (Purge's DELETE races ClaimBatch/ResolveClaim the
+		// same way a send does -- see the class remarks), which must not be double-counted as a
+		// corruption drop by the caller's RaiseCorrupted.
+		// undeserializableIds is always claim.UndeserializableIds from ProcessBatchAsync's ClaimBatch
+		// call -- never null (ClaimedBatch initializes it to an empty list) -- so callers need not
+		// (and must not) pass null; DeleteByIdLocked already no-ops on an empty list, so every branch
+		// below can unconditionally split it out without a separate empty-check first.
+		private int ResolveClaim(List<long> ids, ClaimOutcome outcome, List<long> undeserializableIds)
 		{
 			// Populated inside the lock below, then used to raise ItemDroppedByRetryExhaustion
 			// AFTER the lock is released -- same pattern Enqueue uses for ItemDroppedByCap.
 			List<long> retryExhaustedIds = null;
+			var corruptedRemoved = 0;
 
 			try
 			{
 				lock (_sync)
 				{
 					if (_disposed || _connection == null)
-						return;
+						return 0;
 
 					using (var txn = _connection.BeginTransaction(deferred: false))
 					{
 						if (outcome == ClaimOutcome.Remove)
 						{
-							// Delivered/PoisonDrop path. A straight DELETE -- attempts is never
-							// touched here, so a batch that ultimately succeeds (even after some
-							// number of prior retryable verdicts of either kind) never counts
-							// against the retry ceiling.
-							DeleteByIdLocked(txn, ids);
+							// Delivered/PoisonDrop path (or "every claimed row was undeserializable").
+							// Split the undeserializable subset out of the single DELETE the old code
+							// used, purely so its own affected-row count is available to return below
+							// (a no-op DELETE, no round trip, when it's empty -- see DeleteByIdLocked)
+							// -- attempts is never touched either way, so a batch that ultimately
+							// succeeds (even after some number of prior retryable verdicts of either
+							// kind) never counts against the retry ceiling.
+							corruptedRemoved = DeleteByIdLocked(txn, undeserializableIds);
+							var remaining = new List<long>(ids);
+							remaining.RemoveAll(undeserializableIds.Contains);
+							DeleteByIdLocked(txn, remaining);
 						}
 						else
 						{
 							// Undeserializable rows are removed regardless of which retryable
 							// verdict this is: they can never be delivered, so retrying them
 							// forever would wedge the head of the queue.
-							if (undeserializableIds != null && undeserializableIds.Count > 0)
-								DeleteByIdLocked(txn, undeserializableIds);
+							corruptedRemoved = DeleteByIdLocked(txn, undeserializableIds);
 
 							var toRelease = new List<long>(ids);
-							if (undeserializableIds != null)
-								toRelease.RemoveAll(undeserializableIds.Contains);
+							toRelease.RemoveAll(undeserializableIds.Contains);
 
 							if (toRelease.Count > 0)
 							{
@@ -667,24 +698,30 @@ namespace DesktopAnalytics
 			catch (Exception e)
 			{
 				Debug.WriteLine("SqliteEventSpool.ResolveClaim failed: " + e);
-				return;
+				return 0;
 			}
 
 			// Raised outside the lock: handlers are the caller's code (see RaiseDropped).
 			if (retryExhaustedIds != null && retryExhaustedIds.Count > 0)
 				RaiseRetryExhausted(retryExhaustedIds.Count);
+
+			return corruptedRemoved;
 		}
 
-		private void DeleteByIdLocked(SqliteTransaction txn, List<long> ids)
+		// Returns the number of rows actually deleted (per SQLite's own affected-row count), not
+		// merely ids.Count -- a concurrent Purge() or an already-expired row can mean fewer rows
+		// existed to delete than ids named. See ResolveClaim's corruptedRemoved for why callers
+		// rely on this being the true count rather than an assumed one.
+		private int DeleteByIdLocked(SqliteTransaction txn, List<long> ids)
 		{
 			if (ids.Count == 0)
-				return;
+				return 0;
 
 			using (var cmd = _connection.CreateCommand())
 			{
 				cmd.Transaction = txn;
 				cmd.CommandText = "DELETE FROM events WHERE id IN (" + IdList(ids) + ");";
-				cmd.ExecuteNonQuery();
+				return cmd.ExecuteNonQuery();
 			}
 		}
 
@@ -698,10 +735,13 @@ namespace DesktopAnalytics
 		/// not have to stop at the first non-expired event -- it removes every expired event wherever it sits,
 		/// so an out-of-order timestamp cannot shield older events from the retention floor. A
 		/// corrupt payload is irrelevant here too: the age lives in a column, so nothing has to be
-		/// deserialized to be dated.
+		/// deserialized to be dated. Raises <see cref="ItemDroppedByExpiry"/> once per row actually
+		/// removed this way, so a drop via this path is never silently uncounted in <c>Statistics</c>.
 		/// </remarks>
 		public void TrimExpired(TimeSpan maxAge, DateTimeOffset now)
 		{
+			var dropped = 0;
+
 			try
 			{
 				var cutoffMs = (now - maxAge).ToUnixTimeMilliseconds();
@@ -715,9 +755,13 @@ namespace DesktopAnalytics
 					{
 						cmd.CommandText = "DELETE FROM events WHERE time_unix_ms < @cutoff;";
 						cmd.Parameters.AddWithValue("@cutoff", cutoffMs);
-						cmd.ExecuteNonQuery();
+						dropped = cmd.ExecuteNonQuery();
 					}
 				}
+
+				// Raised outside the lock: handlers are the caller's code (see RaiseDropped).
+				if (dropped > 0)
+					RaiseExpired(dropped);
 			}
 			catch (Exception e)
 			{
@@ -730,7 +774,21 @@ namespace DesktopAnalytics
 		/// DELETE removes the rows; VACUUM rebuilds the database file so the purged bytes are
 		/// actually gone rather than lingering as free pages; the WAL checkpoint/truncate does the
 		/// same for the write-ahead log. All three matter for a CONSENT purge, where "marked
-		/// consumed" is not good enough.
+		/// consumed" is not good enough -- and all three run synchronously, in that order, before
+		/// this method returns: a version that backgrounded the VACUUM/checkpoint step was tried and
+		/// reverted, because it traded a small, bounded, measured cost (below) for a real regression
+		/// -- a crash or kill between this method returning and that background work completing
+		/// would leave the "purged" bytes physically recoverable on disk, which is precisely the
+		/// guarantee a consent purge exists to provide -- while not even fully solving the UI-thread
+		/// concern it was meant to address, since the background work still takes <c>_sync</c>, so
+		/// any other call into this spool (e.g. the next <c>Track()</c>) would simply block on that
+		/// instead. Measured directly (fill a temp SQLite db with ~2KB rows to ~100MB -- twice this
+		/// class's default 50MB byte cap -- then time DELETE FROM events + VACUUM + PRAGMA
+		/// wal_checkpoint(TRUNCATE) back to back): the three together took on the order of 60-80ms
+		/// (roughly 60ms delete, under 20ms checkpoint, VACUUM itself near-instant on a freshly
+		/// emptied table) -- not the multi-second-to-45s stalls the old DiskQueue-backed design
+		/// risked (see the class remarks), which is what justified paying a synchronous cost here at
+		/// all. Reproduce by timing those three statements against a similarly-sized spool.db.
 		/// <para>Contrast the old DiskQueue-backed EventSpool's Purge, which had to dispose the
 		/// queue, delete the whole directory and reopen -- briefly dropping its cross-process lock,
 		/// and degrading to a no-op spool if another process stole it in that window.</para>

@@ -583,6 +583,123 @@ namespace DesktopAnalyticsTests
 			}
 		}
 
+		[Test]
+		public void Flush_SenderAlwaysRetryableRejection_DoesNotErodeAttemptCeilingDuringBoundedDrain()
+		{
+			// Regression test: BoundedDrainAsync (which Flush()/ShutDown() drive) can make up to
+			// kBoundedDrainMaxAttempts (20) attempts back-to-back within its 5s bound -- far faster
+			// than the once-per-30s-tick cadence the retry ceiling was sized against. If it counted
+			// RetryableRejection against the ceiling the same way a normal timer tick does, a single
+			// Flush() call against a server that is quickly rate-limiting/rejecting could burn
+			// through this tiny ceiling in seconds and drop an otherwise-good event.
+			const int maxAttempts = 3;
+			using (var spool = new SqliteEventSpool(_spoolDir, 10, maxAttempts: maxAttempts))
+			{
+				var sender = new AlwaysResultSender(SendResult.RetryableRejection);
+				var client = new MixpanelClient();
+				client.InitializeForTest(spool, sender);
+
+				client.Track("user-1", "Save", null);
+
+				var completed = Task.Run(() => client.Flush()).Wait(TimeSpan.FromSeconds(15));
+
+				Assert.IsTrue(completed, "Flush() did not return within the timeout");
+				Assert.Greater(sender.CallCount, maxAttempts,
+					"the bounded drain loop must have made more attempts than maxAttempts, to prove " +
+					"this is a real exercise of the exemption rather than a vacuously-passing test");
+				Assert.AreEqual(1, spool.ApproximateCount,
+					"a RetryableRejection storm during a single bounded Flush()/ShutDown() drain " +
+					"must not erode the per-event retry ceiling the way a normal timer tick does");
+				Assert.AreEqual(0, client.Statistics.Failed,
+					"the event must not have been dropped");
+			}
+		}
+
+		// ---- UNDESERIALIZABLE (CORRUPT) SPOOLED EVENTS -------------------------------------------
+		//
+		// Regression coverage for IEventSpool.ItemDroppedByCorruption: a claimed row whose payload
+		// cannot be deserialized (on-disk corruption, or a payload from a since-upgraded
+		// incompatible schema) is removed by the spool so it cannot wedge the queue -- but before
+		// this fix, that removal did not increment Statistics.Failed, silently breaking the
+		// invariant Statistics.Submitted == Statistics.Succeeded + Statistics.Failed (Submitted was
+		// already incremented when the event was originally Track()'d).
+
+		[Test]
+		public async Task DrainOnce_EventCorruptedOnDiskBeforeDrain_RemovedAndCountedAsFailed()
+		{
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
+			{
+				var client = new MixpanelClient();
+				var sender = new AlwaysResultSender(SendResult.Delivered);
+				client.InitializeForTest(spool, sender);
+
+				client.Track("user-1", "Save", null);
+				Assert.AreEqual(1, spool.ApproximateCount);
+
+				SpoolCorruptionTestHelper.CorruptAllPayloads(_spoolDir);
+
+				await client.DrainOnceAsync();
+
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"an undeserializable row must be removed rather than retried forever");
+				Assert.AreEqual(0, sender.CallCount,
+					"the sender must never be called for a batch that was entirely undeserializable");
+				Assert.AreEqual(1, client.Statistics.Submitted);
+				Assert.AreEqual(0, client.Statistics.Succeeded);
+				Assert.AreEqual(1, client.Statistics.Failed,
+					"a corrupt/undeserializable row must count as Failed so Submitted == Succeeded + Failed");
+			}
+		}
+
+		// ---- AGE-BASED RETENTION EXPIRY -----------------------------------------------------------
+		//
+		// Regression coverage for IEventSpool.ItemDroppedByExpiry: an event aged out by TrimExpired's
+		// 60-day retention floor is removed so it cannot accumulate forever. Unlike a corrupt row or
+		// a retry-ceiling drop, this is not a delivery failure -- it is counted separately as
+		// Statistics.Expired rather than Statistics.Failed (see OnItemExpired's doc comment).
+
+		[Test]
+		public async Task DrainOnce_EventAgedOutByRetentionFloor_RemovedAndCountedAsExpired()
+		{
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
+			{
+				var client = new MixpanelClient();
+				var sender = new AlwaysResultSender(SendResult.Delivered);
+				client.InitializeForTest(spool, sender);
+
+				client.Track("user-1", "Save", null);
+				Assert.AreEqual(1, spool.ApproximateCount);
+
+				// Backdate the row directly (bypassing Track()'s own time-stamping) so
+				// DrainOnceCoreAsync's automatic TrimExpired call (60-day floor) considers it expired
+				// before ProcessBatchAsync ever gets to claim it.
+				using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(
+					       "Data Source=" + Path.Combine(_spoolDir, "spool.db")))
+				{
+					conn.Open();
+					using (var cmd = conn.CreateCommand())
+					{
+						cmd.CommandText = "UPDATE events SET time_unix_ms = 0;";
+						cmd.ExecuteNonQuery();
+					}
+				}
+
+				await client.DrainOnceAsync();
+
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"an aged-out event must be removed by the retention floor");
+				Assert.AreEqual(0, sender.CallCount,
+					"the sender must never be called for an event trimmed before it could be claimed");
+				Assert.AreEqual(1, client.Statistics.Submitted);
+				Assert.AreEqual(0, client.Statistics.Succeeded);
+				Assert.AreEqual(0, client.Statistics.Failed,
+					"aging out is a retention decision, not a delivery failure -- must not count as Failed");
+				Assert.AreEqual(1, client.Statistics.Expired,
+					"an event dropped by the retention floor must count as Expired so " +
+					"Submitted == Succeeded + Failed + Expired");
+			}
+		}
+
 		// ---- SHUTDOWN OFFLINE -------------------------------------------------------------------
 
 		[Test]
@@ -1043,6 +1160,43 @@ namespace DesktopAnalyticsTests
 
 				Assert.AreEqual(callsAfterFirstTick, sender.CallCount,
 					"the breaker should already be open after just one failing tick, so the sender must not be called again");
+				Assert.Greater(spool.ApproximateCount, 0);
+			}
+		}
+
+		[Test]
+		public async Task DrainOnce_WithRealCircuitBreakerAndZeroDelay_SustainedRetryableRejection_TripsBreakerAndStopsCallingSender()
+		{
+			// Regression test for the bug where the Polly pipeline's ShouldHandle predicate only
+			// checked SendResult.RetryableFailure, never SendResult.RetryableRejection -- so a
+			// sustained run of HTTP 408/429/5xx responses (which DID reach the server, unlike a
+			// connectivity failure) was entirely invisible to both in-tick retry and the circuit
+			// breaker's failure tracking. The client would keep hammering an already-struggling or
+			// rate-limiting server every flush tick with no backoff, exactly what the breaker
+			// exists to prevent.
+			using (var spool = new SqliteEventSpool(_spoolDir, 10))
+			{
+				var sender = new AlwaysResultSender(SendResult.RetryableRejection);
+				var pipeline = MixpanelClient.BuildDefaultPipeline(TimeProvider.System,
+					maxRetryAttempts: 1, retryDelay: TimeSpan.Zero);
+
+				var client = new MixpanelClient();
+				client.InitializeForTest(spool, sender, pipeline: pipeline, batchSize: 1);
+
+				for (var i = 0; i < 8; i++)
+				{
+					client.Track("user-1", "Save-" + i, null);
+					await client.DrainOnceAsync();
+				}
+
+				var callsAfterWarmup = sender.CallCount;
+
+				client.Track("user-1", "OneMore", null);
+				await client.DrainOnceAsync();
+
+				Assert.AreEqual(callsAfterWarmup, sender.CallCount,
+					"once the circuit breaker is open, the sender must not be called again for a " +
+					"sustained RetryableRejection outage either");
 				Assert.Greater(spool.ApproximateCount, 0);
 			}
 		}
