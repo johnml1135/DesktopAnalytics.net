@@ -254,11 +254,46 @@ across restart and across a simulated path/version change.
 
 ### Phase 7 — Consumer integration
 
-1. FieldWorks: bump + add `.Mixpanel`; verify CPM transitive pinning; installer auto-harvests via
-   WiX heat, so `e_sqlite3.dll` needs no installer work (~4.1 MB, 3 Windows RIDs).
-2. FW Lite: adopt; verify the SQLitePCLRaw version story; `PublishSingleFile` on Linux needs
-   `IncludeNativeLibrariesForSelfExtract=true` (FW Lite has likely already solved this).
-3. Segment consumers: no action beyond a version bump.
+Packages, as actually built (Phases 1-6, all committed on this branch):
+
+- **`SIL.DesktopAnalytics`** — facade (`Analytics`), `SegmentClient`, `IClient`, `UserInfo`,
+  `Statistics`. Multi-targets `net462;netstandard2.0;net8.0`.
+- **`SIL.DesktopAnalytics.Mixpanel`** — `MixpanelClient`, `SqliteEventSpool`/`IEventSpool`,
+  `IEventSender`/`MixpanelEventSender`, `AnalyticsEvent`, `PathScrubber`. Same TFMs. References
+  `Microsoft.Data.Sqlite`, Polly, `mixpanel-csharp` — none of which leak into core (verified via
+  `dotnet list package --include-transitive`).
+
+API break, major version bump (D4): `ClientType` enum is gone. Callers now inject an `IClient`:
+```csharp
+// before
+new Analytics(apiSecret, userInfo, clientType: ClientType.Mixpanel);
+// after (classic FieldWorks / FW Lite -- add a reference to SIL.DesktopAnalytics.Mixpanel)
+new Analytics(apiSecret, userInfo, client: new MixpanelClient());
+// Segment default is unchanged -- omitting `client` still defaults to `new SegmentClient()`
+new Analytics(apiSecret, userInfo);
+```
+
+1. **FieldWorks (classic):** add a `SIL.DesktopAnalytics.Mixpanel` package reference; change the
+   `ClientType.Mixpanel` call site to `client: new MixpanelClient()` per above. Installer:
+   `e_sqlite3.dll` (~4.1 MB, 3 Windows RIDs) is a normal transitive native asset under
+   `Microsoft.Data.Sqlite`; WiX heat auto-harvests it the same way it already does for
+   `libSkiaSharp`/`libHarfBuzzSharp`/icu.net — no installer authoring expected, but worth a
+   sanity-check build once adopted. **Flag for FieldWorks to verify themselves:** this package
+   pins `SQLitePCLRaw.bundle_e_sqlite3` 2.1.6 (via `Microsoft.Data.Sqlite` 8.0.10); if FieldWorks
+   pins a different SQLitePCLRaw version anywhere else in its dependency graph, NuGet unifies
+   upward and FieldWorks should confirm that causes no issues.
+2. **FW Lite:** same package addition; this is what makes it consumable at all (previously
+   net462-only). **Flag for FW Lite to verify themselves:** FW Lite reportedly already pins
+   `SQLitePCLRaw` 3.0.3 via `EFCore.Sqlite` 10.0.8 — higher than this package's 2.1.6, so NuGet
+   unification should just take FW Lite's existing pin with no action needed, but confirm rather
+   than assume. `PublishSingleFile` on Linux needs `IncludeNativeLibrariesForSelfExtract=true` for
+   the SQLite native asset to extract correctly; FW Lite very likely already has this set (it
+   would need it for its own existing SQLite dependency), but worth confirming when adopting.
+3. **Segment consumers (Bloom, HearThis, SayMore, Glyssen, Transcelerator):** version bump only.
+   They take `SIL.DesktopAnalytics` alone and end up *lighter* than PR #43 would have left them —
+   no DiskQueue/Polly/mixpanel-csharp/SQLite in their dependency graph at all. No code changes
+   expected unless a consumer explicitly referenced `ClientType` (none should have, since none use
+   Mixpanel).
 
 ## Risks
 
@@ -277,11 +312,39 @@ across restart and across a simulated path/version change.
 
 ## Current state (what exists today, on `feature/offline-mixpanel-durability`)
 
-- 172/172 tests green.
-- `IEventSpool` extracted; `EventSpool` (DiskQueue) and `SqliteEventSpool` both implement it.
-- `EventSpoolContractTests<TFactory>` — 28 tests x 2 engines = 56, proving behavioral parity.
-- `TrackResponsivenessTests` — SQLite returns in single-digit ms; DiskQueue blocks for the whole
-  send (pinned as a characterization test).
-- **Production still uses DiskQueue.** `MixpanelClient.Initialize` constructs `EventSpool`. Nothing
-  is adopted yet.
+Phases 1-6 are done, each independently rebuilt/retested/inspected (not just taken on a
+subagent's word) before being committed:
+
+- **Phase 1:** multi-targets `net462;netstandard2.0;net8.0`. `#if NET462` keeps
+  `ApplicationSettingsBase`/`user.config` byte-for-byte; modern TFMs get a JSON-backed
+  `IAnalyticsSettingsStore` at a stable path. No legacy-import logic (deliberately not built --
+  see the Risks table).
+- **Phase 2:** split into `SIL.DesktopAnalytics` + `SIL.DesktopAnalytics.Mixpanel`. `ClientType`
+  enum replaced by `IClient` injection. Verified via `dotnet list package --include-transitive`
+  that core carries none of DiskQueue/Sqlite/Polly/mixpanel-csharp.
+- **Phase 3:** `SqliteEventSpool` adopted in production; `EventSpool`/DiskQueue deleted entirely.
+  Never-throws contract verified by inspection (all six `IEventSpool` members on
+  `SqliteEventSpool` log-and-swallow).
+- **Phase 4:** `TrackAsync`/`ReportExceptionAsync` added across `IClient`/`SegmentClient`/
+  `MixpanelClient`/`Analytics`, honest about being ergonomics (Microsoft.Data.Sqlite has no true
+  async I/O) rather than a concurrency fix. Verified with a timed test: ~0.8ms while a send is
+  genuinely in flight.
+- **Phase 5:** per-event retry ceiling (default 10 attempts). Caught and fixed a real bug before
+  shipping it: a naive counter would have dropped good events after ~5 minutes offline, since
+  "can't reach the server" and "server rejected this" both collapsed into one `RetryableFailure`
+  value. Split into `RetryableFailure` (connectivity, never counted) vs. new
+  `RetryableRejection` (408/429/5xx, counted) — verified against the 3 tests that caught the bug.
+- **Phase 6:** `ShutDownAsync` now calls `CancelInFlightSend()` (closing a gap where a
+  timer-driven drain wedged mid-send would otherwise linger past `ShutDown`'s own dispose).
+  Drain pacing now accelerates (1s) after a tick that made progress and still leaves a backlog,
+  instead of waiting the full 30s interval — fixes an estimated 50-100 minute full-backlog clear
+  time down to accelerated back-to-back ticks. Both verified with real `Stopwatch` measurements,
+  not just green tests.
+
+Suite: 114 Mixpanel tests + 19 (net8.0) / 14 (net462) core tests, all green on both runnable TFMs.
+Not yet pushed to the fork that backs PR #43 (fork last saw only the plan-doc commit) --
+none of this rework is visible on the PR yet.
 - `CONTEXT.md` and `offline-analytics.md` corrected re: the fabricated invariant.
+- **Phase 7 (this phase):** consumer integration notes above are written; PR #43's description
+  still describes the pre-rework (DiskQueue, single-package) design and has not been touched --
+  see below.
