@@ -72,36 +72,39 @@ namespace DesktopAnalyticsTests
 		}
 
 		[Test]
-		public async Task Send_500Response_ReturnsRetryableFailure()
+		public async Task Send_500Response_ReturnsRetryableRejection()
 		{
 			_server.Given(ImportRequest())
 				.RespondWith(Response.Create().WithStatusCode(500));
 
 			var sender = new MixpanelEventSender("secret", _server.Urls[0]);
 
-			Assert.AreEqual(SendResult.RetryableFailure, (await sender.SendBatchAsync(OneEvent())).Outcome);
+			// A 5xx means the request DID reach Mixpanel -- distinct from a connectivity failure
+			// (see SendResult.RetryableRejection), so it counts against the spool's retry-attempt
+			// ceiling where RetryableFailure does not.
+			Assert.AreEqual(SendResult.RetryableRejection, (await sender.SendBatchAsync(OneEvent())).Outcome);
 		}
 
 		[Test]
-		public async Task Send_429Response_ReturnsRetryableFailure()
+		public async Task Send_429Response_ReturnsRetryableRejection()
 		{
 			_server.Given(ImportRequest())
 				.RespondWith(Response.Create().WithStatusCode(429));
 
 			var sender = new MixpanelEventSender("secret", _server.Urls[0]);
 
-			Assert.AreEqual(SendResult.RetryableFailure, (await sender.SendBatchAsync(OneEvent())).Outcome);
+			Assert.AreEqual(SendResult.RetryableRejection, (await sender.SendBatchAsync(OneEvent())).Outcome);
 		}
 
 		[Test]
-		public async Task Send_408Response_ReturnsRetryableFailure()
+		public async Task Send_408Response_ReturnsRetryableRejection()
 		{
 			_server.Given(ImportRequest())
 				.RespondWith(Response.Create().WithStatusCode(408));
 
 			var sender = new MixpanelEventSender("secret", _server.Urls[0]);
 
-			Assert.AreEqual(SendResult.RetryableFailure, (await sender.SendBatchAsync(OneEvent())).Outcome);
+			Assert.AreEqual(SendResult.RetryableRejection, (await sender.SendBatchAsync(OneEvent())).Outcome);
 		}
 
 		[Test]

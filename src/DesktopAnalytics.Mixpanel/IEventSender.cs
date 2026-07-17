@@ -7,11 +7,12 @@ namespace DesktopAnalytics
 	/// <summary>
 	/// The outcome of attempting to deliver one batch of events. Mixpanel's /import endpoint
 	/// yields exactly two shapes of outcome, and this type models both: either the whole request
-	/// failed to be processed (<see cref="Outcome"/> is <see cref="SendResult.RetryableFailure"/>
-	/// or <see cref="SendResult.PoisonDrop"/>, applying to every event in the batch), or the
-	/// request WAS processed (<see cref="SendResult.Delivered"/>) with zero or more individual
-	/// records rejected as permanently invalid (<see cref="FailedIndices"/> -- /import's
-	/// <c>failed_records</c>; the remainder were ingested).
+	/// failed to be processed (<see cref="Outcome"/> is <see cref="SendResult.RetryableFailure"/>,
+	/// <see cref="SendResult.RetryableRejection"/>, or <see cref="SendResult.PoisonDrop"/>,
+	/// applying to every event in the batch), or the request WAS processed
+	/// (<see cref="SendResult.Delivered"/>) with zero or more individual records rejected as
+	/// permanently invalid (<see cref="FailedIndices"/> -- /import's <c>failed_records</c>; the
+	/// remainder were ingested).
 	/// </summary>
 	internal class BatchSendResult
 	{
@@ -20,9 +21,11 @@ namespace DesktopAnalytics
 		/// <summary>Whole-batch verdict. <see cref="SendResult.Delivered"/> means the request was
 		/// processed and every event is finished with (ingested, or rejected-and-reported in
 		/// <see cref="FailedIndices"/>) -- the caller should remove the whole batch from the
-		/// spool. <see cref="SendResult.RetryableFailure"/> means nothing was processed and the
-		/// whole batch should be retried later. <see cref="SendResult.PoisonDrop"/> means the
-		/// whole batch was permanently rejected (e.g. an unexpected 4xx) and should be dropped.</summary>
+		/// spool. <see cref="SendResult.RetryableFailure"/> and <see cref="SendResult
+		/// .RetryableRejection"/> both mean nothing was processed and the whole batch should be
+		/// retried later -- they differ only in whether the round trip actually reached the server
+		/// (see each value's own doc). <see cref="SendResult.PoisonDrop"/> means the whole batch
+		/// was permanently rejected (e.g. an unexpected 4xx) and should be dropped.</summary>
 		public SendResult Outcome { get; }
 
 		/// <summary>When <see cref="Outcome"/> is <see cref="SendResult.Delivered"/>: the
@@ -38,6 +41,8 @@ namespace DesktopAnalytics
 
 		public static readonly BatchSendResult Delivered = new BatchSendResult(SendResult.Delivered);
 		public static readonly BatchSendResult Retryable = new BatchSendResult(SendResult.RetryableFailure);
+		public static readonly BatchSendResult RetryableRejection =
+			new BatchSendResult(SendResult.RetryableRejection);
 		public static readonly BatchSendResult Poison = new BatchSendResult(SendResult.PoisonDrop);
 	}
 

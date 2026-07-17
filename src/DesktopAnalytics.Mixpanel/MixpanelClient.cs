@@ -71,6 +71,13 @@ namespace DesktopAnalytics
 		// since MixpanelEventSender uses /import, which has no such limit).
 		private const int kDefaultMaxSpoolAgeDays = 60;
 
+		// Per-event retry ceiling (offline-analytics-v2-plan.md, Phase 5 / decision D6): a single
+		// event that keeps coming back as RetryableFailure (e.g. a bug in serialization that never
+		// quite hits the PoisonDrop path) would otherwise wedge the head of the queue behind it
+		// forever -- previously bounded only by the 60-day age floor above, i.e. up to 60 days of
+		// pointless retries.
+		private const int kDefaultMaxRetryAttempts = 10;
+
 		// On (re)start, attempt the first drain soon rather than waiting a full interval, so events
 		// spooled during a PREVIOUS (offline) session go out shortly after launch instead of ~30s later.
 		private const int kInitialFlushDelaySeconds = 3;
@@ -158,8 +165,9 @@ namespace DesktopAnalytics
 				_timeProvider = TimeProvider.System;
 				_spool = new SqliteEventSpool(SqliteEventSpool.GetDefaultSpoolPath(apiSecret),
 					kDefaultMaxSpoolItems, kMaxSpooledEventBytes, kDefaultMaxSpoolBytes,
-					timeProvider: _timeProvider);
+					timeProvider: _timeProvider, maxAttempts: kDefaultMaxRetryAttempts);
 				_spool.ItemDroppedByCap += OnItemDroppedByCap;
+				_spool.ItemDroppedByRetryExhaustion += OnItemDroppedByRetryExhaustion;
 				_sender = new MixpanelEventSender(apiSecret);
 				_pipeline = BuildDefaultPipeline(_timeProvider);
 
@@ -204,7 +212,10 @@ namespace DesktopAnalytics
 			_initialized = true;
 			_spool = spool;
 			if (_spool != null)
+			{
 				_spool.ItemDroppedByCap += OnItemDroppedByCap;
+				_spool.ItemDroppedByRetryExhaustion += OnItemDroppedByRetryExhaustion;
+			}
 			_sender = sender;
 			_timeProvider = timeProvider ?? TimeProvider.System;
 			_pipeline = pipeline ?? ResiliencePipeline<BatchSendResult>.Empty;
@@ -215,6 +226,14 @@ namespace DesktopAnalytics
 		// for events dropped later by cap enforcement, not just ones dropped at enqueue time -- see
 		// IEventSpool.ItemDroppedByCap.
 		private void OnItemDroppedByCap()
+		{
+			Interlocked.Increment(ref _failed);
+		}
+
+		// Same statistics effect as cap eviction (see OnItemDroppedByCap above): an event dropped
+		// for exceeding the retry ceiling will also never be delivered. See
+		// IEventSpool.ItemDroppedByRetryExhaustion.
+		private void OnItemDroppedByRetryExhaustion()
 		{
 			Interlocked.Increment(ref _failed);
 		}

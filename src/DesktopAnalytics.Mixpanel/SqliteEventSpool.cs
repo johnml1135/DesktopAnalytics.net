@@ -56,6 +56,7 @@ namespace DesktopAnalytics
 		private readonly int _maxItems;
 		private readonly int _maxItemBytes;
 		private readonly long _maxSpoolBytes;
+		private readonly int _maxAttempts;
 		private readonly string _spoolDirectory;
 		private readonly string _databasePath;
 		private readonly TimeProvider _timeProvider;
@@ -69,6 +70,9 @@ namespace DesktopAnalytics
 		/// <inheritdoc/>
 		public event Action ItemDroppedByCap;
 
+		/// <inheritdoc/>
+		public event Action ItemDroppedByRetryExhaustion;
+
 		/// <param name="spoolDirectory">Directory to hold the spool database. Callers normally get
 		/// this from <see cref="GetDefaultSpoolPath"/>; tests inject a temp directory.</param>
 		/// <param name="maxItems">Maximum number of events retained; enqueuing beyond this drops
@@ -78,11 +82,18 @@ namespace DesktopAnalytics
 		/// <param name="maxSpoolBytes">Maximum total serialized size of all retained events;
 		/// enqueuing beyond this drops the oldest first.</param>
 		/// <param name="timeProvider">Clock for lease expiry. Injected so tests stay deterministic.</param>
+		/// <param name="maxAttempts">Maximum number of <see cref="SendResult.RetryableFailure"/>
+		/// verdicts a single event may accumulate before it is permanently dropped (see
+		/// offline-analytics-v2-plan.md, Phase 5 / decision D6) and
+		/// <see cref="ItemDroppedByRetryExhaustion"/> is raised for it. Bounds the case where a
+		/// single poison event -- one that always fails but never classifies as
+		/// <see cref="SendResult.PoisonDrop"/> -- would otherwise wedge the head of the queue
+		/// forever.</param>
 		/// <exception cref="Exception">Propagates a failure to create/open the database. This is
 		/// deliberately not swallowed: it is a startup-time condition the caller needs to know
 		/// about.</exception>
 		public SqliteEventSpool(string spoolDirectory, int maxItems, int maxItemBytes = int.MaxValue,
-			long maxSpoolBytes = long.MaxValue, TimeProvider timeProvider = null)
+			long maxSpoolBytes = long.MaxValue, TimeProvider timeProvider = null, int maxAttempts = 10)
 		{
 			if (maxItems < 0)
 				throw new ArgumentOutOfRangeException(nameof(maxItems));
@@ -90,10 +101,13 @@ namespace DesktopAnalytics
 				throw new ArgumentOutOfRangeException(nameof(maxItemBytes));
 			if (maxSpoolBytes <= 0)
 				throw new ArgumentOutOfRangeException(nameof(maxSpoolBytes));
+			if (maxAttempts < 0)
+				throw new ArgumentOutOfRangeException(nameof(maxAttempts));
 
 			_maxItems = maxItems;
 			_maxItemBytes = maxItemBytes;
 			_maxSpoolBytes = maxSpoolBytes;
+			_maxAttempts = maxAttempts;
 			_spoolDirectory = spoolDirectory;
 			_databasePath = Path.Combine(spoolDirectory, "spool.db");
 			_timeProvider = timeProvider ?? TimeProvider.System;
@@ -138,7 +152,8 @@ namespace DesktopAnalytics
 				"  time_unix_ms INTEGER NOT NULL," +
 				"  lease_until_unix_ms INTEGER NOT NULL DEFAULT 0," +
 				"  len INTEGER NOT NULL," +
-				"  payload BLOB NOT NULL);");
+				"  payload BLOB NOT NULL," +
+				"  attempts INTEGER NOT NULL DEFAULT 0);");
 			Execute(connection, "CREATE INDEX IF NOT EXISTS ix_events_time ON events(time_unix_ms);");
 			Execute(connection,
 				"CREATE INDEX IF NOT EXISTS ix_events_lease ON events(lease_until_unix_ms, id);");
@@ -318,6 +333,21 @@ namespace DesktopAnalytics
 			}
 		}
 
+		private void RaiseRetryExhausted(int count)
+		{
+			for (var i = 0; i < count; i++)
+			{
+				try
+				{
+					ItemDroppedByRetryExhaustion?.Invoke();
+				}
+				catch (Exception e)
+				{
+					Debug.WriteLine("SqliteEventSpool: ItemDroppedByRetryExhaustion handler threw: " + e);
+				}
+			}
+		}
+
 		// Caller must hold _sync. Brings the spool back within BOTH caps, dropping oldest first,
 		// and returns how many events were dropped. Two DELETEs, no loop -- contrast the old
 		// DiskQueue-backed EventSpool.EnforceCapLocked, which dequeued one item at a time.
@@ -386,7 +416,7 @@ namespace DesktopAnalytics
 				{
 					// Everything claimed was undeserializable (corrupt, or an incompatible schema
 					// version). Nothing to send; just remove them so they cannot wedge the spool.
-					ResolveClaim(claim.Ids, remove: true);
+					ResolveClaim(claim.Ids, ClaimOutcome.Remove);
 					return;
 				}
 
@@ -398,20 +428,56 @@ namespace DesktopAnalytics
 				}
 				catch (Exception e)
 				{
+					// A throwing send is a connectivity-style failure (we don't know anything about
+					// this batch's deliverability), exactly like SendResult.RetryableFailure -- see
+					// ResolveOutcome. Must NOT count against the retry-attempt ceiling.
 					Debug.WriteLine("SqliteEventSpool.ProcessBatch: send threw, leaving batch for retry: " + e);
-					ResolveClaim(claim.Ids, remove: false);
+					ResolveClaim(claim.Ids, ClaimOutcome.ReleaseOnly);
 					return;
 				}
 
-				// Delivered/PoisonDrop: the batch is finished with either way, so remove it.
-				// RetryableFailure: release the lease so the next drain picks it up, in order.
-				ResolveClaim(claim.Ids,
-					remove: result == SendResult.Delivered || result == SendResult.PoisonDrop,
-					undeserializableIds: claim.UndeserializableIds);
+				ResolveClaim(claim.Ids, ResolveOutcome(result), undeserializableIds: claim.UndeserializableIds);
 			}
 			catch (Exception e)
 			{
 				Debug.WriteLine("SqliteEventSpool.ProcessBatch failed: " + e);
+			}
+		}
+
+		// What ResolveClaim should do with a resolved (non-empty-events) batch. Distinct from
+		// SendResult because Delivered/PoisonDrop collapse to the same DELETE, and because the two
+		// "leave it spooled" verdicts differ in whether they touch the attempts counter -- see
+		// each member's doc and SendResult.RetryableFailure/RetryableRejection.
+		private enum ClaimOutcome
+		{
+			// Delivered or PoisonDrop (or every claimed row was undeserializable): the batch is
+			// finished with either way. Straight DELETE; attempts is never touched.
+			Remove,
+
+			// SendResult.RetryableFailure, or send() throwing: a connectivity-style failure -- we
+			// don't know anything about this batch's actual deliverability, only that the round
+			// trip didn't complete. Release the lease so the next drain retries it, in order, but
+			// do NOT touch attempts: being offline, however long, must never erode the retry
+			// budget (the age-based retention floor is the correct, sole backstop for that).
+			ReleaseOnly,
+
+			// SendResult.RetryableRejection: the batch reached the server and got a definite "try
+			// again later". Release the lease AND bump attempts, dropping any event whose count
+			// just reached the configured maximum.
+			CountAttemptAndRelease
+		}
+
+		private static ClaimOutcome ResolveOutcome(SendResult result)
+		{
+			switch (result)
+			{
+				case SendResult.Delivered:
+				case SendResult.PoisonDrop:
+					return ClaimOutcome.Remove;
+				case SendResult.RetryableRejection:
+					return ClaimOutcome.CountAttemptAndRelease;
+				default: // SendResult.RetryableFailure
+					return ClaimOutcome.ReleaseOnly;
 			}
 		}
 
@@ -504,10 +570,17 @@ namespace DesktopAnalytics
 			return claim;
 		}
 
-		// Short, purely-local transaction closing out a claim: either remove the rows (the batch is
-		// finished with) or clear their lease so the next drain retries them in order.
-		private void ResolveClaim(List<long> ids, bool remove, List<long> undeserializableIds = null)
+		// Short, purely-local transaction closing out a claim. ClaimOutcome.Remove: straight
+		// DELETE. Otherwise: clear the lease so the next drain retries the batch, in order -- and,
+		// ONLY for CountAttemptAndRelease, also bump the attempt counter and drop any event whose
+		// count just reached the configured max (dropped NOW, not on some future failure, since
+		// the check runs after the increment).
+		private void ResolveClaim(List<long> ids, ClaimOutcome outcome, List<long> undeserializableIds = null)
 		{
+			// Populated inside the lock below, then used to raise ItemDroppedByRetryExhaustion
+			// AFTER the lock is released -- same pattern Enqueue uses for ItemDroppedByCap.
+			List<long> retryExhaustedIds = null;
+
 			try
 			{
 				lock (_sync)
@@ -517,15 +590,19 @@ namespace DesktopAnalytics
 
 					using (var txn = _connection.BeginTransaction(deferred: false))
 					{
-						if (remove)
+						if (outcome == ClaimOutcome.Remove)
 						{
+							// Delivered/PoisonDrop path. A straight DELETE -- attempts is never
+							// touched here, so a batch that ultimately succeeds (even after some
+							// number of prior retryable verdicts of either kind) never counts
+							// against the retry ceiling.
 							DeleteByIdLocked(txn, ids);
 						}
 						else
 						{
-							// Undeserializable rows are removed even on a retryable verdict: they
-							// can never be delivered, so retrying them forever would wedge the
-							// head of the queue.
+							// Undeserializable rows are removed regardless of which retryable
+							// verdict this is: they can never be delivered, so retrying them
+							// forever would wedge the head of the queue.
 							if (undeserializableIds != null && undeserializableIds.Count > 0)
 								DeleteByIdLocked(txn, undeserializableIds);
 
@@ -535,13 +612,50 @@ namespace DesktopAnalytics
 
 							if (toRelease.Count > 0)
 							{
-								using (var cmd = _connection.CreateCommand())
+								if (outcome == ClaimOutcome.CountAttemptAndRelease)
 								{
-									cmd.Transaction = txn;
-									cmd.CommandText =
-										"UPDATE events SET lease_until_unix_ms = 0 WHERE id IN (" +
-										IdList(toRelease) + ");";
-									cmd.ExecuteNonQuery();
+									using (var cmd = _connection.CreateCommand())
+									{
+										cmd.Transaction = txn;
+										cmd.CommandText =
+											"UPDATE events SET attempts = attempts + 1, lease_until_unix_ms = 0 " +
+											"WHERE id IN (" + IdList(toRelease) + ");";
+										cmd.ExecuteNonQuery();
+									}
+
+									// Must run AFTER the increment above so an event whose attempts
+									// just reached maxAttempts on THIS failure is caught
+									// immediately, not on some future failure.
+									retryExhaustedIds = new List<long>();
+									using (var cmd = _connection.CreateCommand())
+									{
+										cmd.Transaction = txn;
+										cmd.CommandText =
+											"SELECT id FROM events WHERE id IN (" + IdList(toRelease) + ") " +
+											"AND attempts >= @maxAttempts;";
+										cmd.Parameters.AddWithValue("@maxAttempts", _maxAttempts);
+										using (var reader = cmd.ExecuteReader())
+										{
+											while (reader.Read())
+												retryExhaustedIds.Add(reader.GetInt64(0));
+										}
+									}
+
+									if (retryExhaustedIds.Count > 0)
+										DeleteByIdLocked(txn, retryExhaustedIds);
+								}
+								else
+								{
+									// ReleaseOnly: connectivity-style failure -- attempts is
+									// deliberately left untouched (see ClaimOutcome.ReleaseOnly).
+									using (var cmd = _connection.CreateCommand())
+									{
+										cmd.Transaction = txn;
+										cmd.CommandText =
+											"UPDATE events SET lease_until_unix_ms = 0 WHERE id IN (" +
+											IdList(toRelease) + ");";
+										cmd.ExecuteNonQuery();
+									}
 								}
 							}
 						}
@@ -553,7 +667,12 @@ namespace DesktopAnalytics
 			catch (Exception e)
 			{
 				Debug.WriteLine("SqliteEventSpool.ResolveClaim failed: " + e);
+				return;
 			}
+
+			// Raised outside the lock: handlers are the caller's code (see RaiseDropped).
+			if (retryExhaustedIds != null && retryExhaustedIds.Count > 0)
+				RaiseRetryExhausted(retryExhaustedIds.Count);
 		}
 
 		private void DeleteByIdLocked(SqliteTransaction txn, List<long> ids)

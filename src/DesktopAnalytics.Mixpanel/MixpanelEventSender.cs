@@ -167,7 +167,11 @@ namespace DesktopAnalytics
 					}
 
 					if (status == 408 || status == 429 || status >= 500)
-						return BatchSendResult.Retryable;
+						// Unlike the network/timeout/redirect cases above, we DID reach Mixpanel and
+						// it gave a definite "try again later" -- counts against the retry-attempt
+						// ceiling (see SendResult.RetryableRejection), unlike the connectivity-style
+						// failures elsewhere in this method.
+						return BatchSendResult.RetryableRejection;
 
 					if (status == 400)
 					{

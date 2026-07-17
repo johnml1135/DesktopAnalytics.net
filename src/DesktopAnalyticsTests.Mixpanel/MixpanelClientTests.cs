@@ -500,6 +500,89 @@ namespace DesktopAnalyticsTests
 			}
 		}
 
+		// ---- RETRY-ATTEMPT CEILING VS. PLAIN CONNECTIVITY FAILURE -------------------------------
+		//
+		// Regression coverage for the gap found wiring up the Phase 5 retry-attempt ceiling: a
+		// naive "increment attempts on every RetryableFailure" implementation would also erode the
+		// budget on plain offline stretches (SendResult.RetryableFailure), not just on a genuine
+		// per-event server rejection (SendResult.RetryableRejection) -- e.g. dropping queued events
+		// after only ~5 minutes offline at the default flush cadence, or within a single offline
+		// ShutDown()/Flush() call (BoundedDrain's internal tight retry loop). These prove the two
+		// SendResult values are handled distinctly all the way through MixpanelClient.
+
+		[Test]
+		public async Task DrainRepeatedly_SenderAlwaysRetryableRejection_EventDroppedAfterMaxAttempts()
+		{
+			const int maxAttempts = 5;
+			using (var spool = new SqliteEventSpool(_spoolDir, 10, maxAttempts: maxAttempts))
+			{
+				var sender = new AlwaysResultSender(SendResult.RetryableRejection);
+				var client = new MixpanelClient();
+				client.InitializeForTest(spool, sender);
+
+				var exhaustedCount = 0;
+				// ItemDroppedByRetryExhaustion is on IEventSpool; MixpanelClient itself only
+				// exposes it via Statistics.Failed, so subscribe directly on the spool here to
+				// pinpoint exactly when the drop happens.
+				spool.ItemDroppedByRetryExhaustion += () => Interlocked.Increment(ref exhaustedCount);
+
+				client.Track("user-1", "Save", null);
+
+				// maxAttempts - 1 = 4 drains: a genuine server rejection each time, but not yet
+				// enough to hit the ceiling.
+				for (var i = 0; i < maxAttempts - 1; i++)
+					await client.DrainOnceAsync();
+
+				Assert.AreEqual(1, spool.ApproximateCount,
+					"after " + (maxAttempts - 1) + " RetryableRejection verdicts (< maxAttempts = " +
+					maxAttempts + "), the event must still be spooled");
+				Assert.AreEqual(0, exhaustedCount);
+
+				// The 5th (== maxAttempts) drain must drop it.
+				await client.DrainOnceAsync();
+
+				Assert.AreEqual(0, spool.ApproximateCount,
+					"the " + maxAttempts + "th RetryableRejection must drop the event");
+				Assert.AreEqual(1, exhaustedCount,
+					"ItemDroppedByRetryExhaustion must fire exactly once");
+				Assert.AreEqual(1, client.Statistics.Failed,
+					"a retry-exhaustion drop must count as Failed, same as cap eviction");
+			}
+		}
+
+		[Test]
+		public async Task DrainRepeatedly_SenderAlwaysPlainRetryableFailure_NeverErodesAttemptBudgetNoMatterHowManyTimes()
+		{
+			const int maxAttempts = 5;
+			using (var spool = new SqliteEventSpool(_spoolDir, 10, maxAttempts: maxAttempts))
+			{
+				// Simulates plain "offline" (or a throwing/circuit-broken sender) -- a connectivity
+				// failure, not a server response -- via SendResult.RetryableFailure.
+				var sender = new AlwaysResultSender(SendResult.RetryableFailure);
+				var client = new MixpanelClient();
+				client.InitializeForTest(spool, sender);
+
+				var exhaustedCount = 0;
+				spool.ItemDroppedByRetryExhaustion += () => Interlocked.Increment(ref exhaustedCount);
+
+				client.Track("user-1", "Save", null);
+
+				// Far more than maxAttempts (5) -- if RetryableFailure incremented attempts like
+				// RetryableRejection does, this would have dropped the event long ago.
+				const int drains = 50;
+				for (var i = 0; i < drains; i++)
+					await client.DrainOnceAsync();
+
+				Assert.AreEqual(1, spool.ApproximateCount,
+					drains + " plain connectivity failures (SendResult.RetryableFailure) must NOT " +
+					"erode the retry-attempt budget -- the event must still be spooled");
+				Assert.AreEqual(0, exhaustedCount,
+					"ItemDroppedByRetryExhaustion must never fire for connectivity-style failures");
+				Assert.AreEqual(0, client.Statistics.Failed,
+					"an event merely retried while offline must not count as Failed");
+			}
+		}
+
 		// ---- SHUTDOWN OFFLINE -------------------------------------------------------------------
 
 		[Test]

@@ -9,9 +9,14 @@ namespace DesktopAnalytics
 	/// The outcome of attempting to deliver one batch of spooled events, as reported by the caller
 	/// of <see cref="IEventSpool.ProcessBatchAsync"/>. This drives whether the batch is removed
 	/// from the spool (<see cref="Delivered"/>/<see cref="PoisonDrop"/>) or left in place for a
-	/// later retry (<see cref="RetryableFailure"/>). (Per-record rejections within a processed
-	/// batch are the sender/client's concern -- see <see cref="BatchSendResult.FailedIndices"/> --
-	/// and count as <see cref="Delivered"/> here: the batch is finished with either way.)
+	/// later retry (<see cref="RetryableFailure"/> or <see cref="RetryableRejection"/>). Both
+	/// retry outcomes release the batch's lease the same way; they differ ONLY in whether the
+	/// retry is counted against the per-event attempt ceiling (see
+	/// <c>SqliteEventSpool.ResolveClaim</c> and offline-analytics-v2-plan.md, Phase 5 / decision
+	/// D6) -- see each member's doc for the line between them. (Per-record rejections within a
+	/// processed batch are the sender/client's concern -- see
+	/// <see cref="BatchSendResult.FailedIndices"/> -- and count as <see cref="Delivered"/> here:
+	/// the batch is finished with either way.)
 	/// </summary>
 	internal enum SendResult
 	{
@@ -19,9 +24,23 @@ namespace DesktopAnalytics
 		/// where the rejected records are individually reported). Remove it from the spool.</summary>
 		Delivered,
 
-		/// <summary>A transient failure (connection error, timeout, 5xx, 429). Leave the batch in
-		/// the spool for a later retry.</summary>
+		/// <summary>A connectivity-level failure: the round trip could not be completed at all, so
+		/// nothing is known about this batch's actual deliverability -- a connection error, DNS
+		/// failure, timeout, a captive-portal-style 3xx interception, a bounded-drain
+		/// cancellation, or a circuit breaker sitting open from a prior outage. Leave the batch in
+		/// the spool for a later retry, and (unlike <see cref="RetryableRejection"/>) do NOT count
+		/// it against the retry-attempt ceiling: being offline, however long, must never erode
+		/// that budget -- the age-based retention floor is the correct, sole backstop for an
+		/// offline stretch.</summary>
 		RetryableFailure,
+
+		/// <summary>The batch DID reach the server and got back a definite "try again later" (HTTP
+		/// 408, 429, or 5xx). Leave the batch in the spool for a later retry, same as
+		/// <see cref="RetryableFailure"/>, but DOES count against the retry-attempt ceiling: a
+		/// batch that keeps coming back this way is failing for a reason other than plain
+		/// connectivity, which is exactly the "stuck retrying a single bad event forever" case the
+		/// ceiling exists to bound.</summary>
+		RetryableRejection,
 
 		/// <summary>A non-retryable failure (e.g. a 4xx that will never succeed). Remove the batch
 		/// from the spool anyway so bad events cannot wedge the spool forever.</summary>
@@ -57,6 +76,14 @@ namespace DesktopAnalytics
 		/// the spool.
 		/// </summary>
 		event Action ItemDroppedByCap;
+
+		/// <summary>
+		/// Raised once per event permanently dropped for exceeding the maximum retry attempt count
+		/// (see offline-analytics-v2-plan.md, Phase 5 / decision D6) -- distinct from
+		/// <see cref="ItemDroppedByCap"/>, which is capacity-based eviction, not a delivery failure.
+		/// Handlers must be fast and must not call back into the spool.
+		/// </summary>
+		event Action ItemDroppedByRetryExhaustion;
 
 		/// <summary>An approximate count of events currently spooled. Accurate enough for
 		/// bounding and diagnostics; not a hard guarantee under concurrent access.</summary>
